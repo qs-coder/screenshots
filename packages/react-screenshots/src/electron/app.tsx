@@ -33,6 +33,17 @@ export default function App (): JSX.Element {
     window.screenshots.cancel()
   }, [])
 
+  const onStart = useCallback(() => {
+    window.screenshots.start()
+  }, [])
+
+  const onStop = useCallback(() => {
+    if (!display) {
+      return
+    }
+    window.screenshots.stop(display)
+  }, [display])
+
   const onOk = useCallback(
     async (blob: Blob | null, bounds: Bounds) => {
       if (!display || !blob) {
@@ -94,6 +105,8 @@ export default function App (): JSX.Element {
         onSave={onSave}
         onCancel={onCancel}
         onOk={onOk}
+        onStart={onStart}
+        onStop={onStop}
       />
     </div>
   )

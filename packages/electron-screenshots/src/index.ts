@@ -7,6 +7,7 @@ import {
   dialog,
   ipcMain,
   nativeImage,
+  screen,
 } from 'electron';
 import Events from 'events';
 import fs from 'fs-extra';
@@ -65,6 +66,16 @@ export default class Screenshots extends Events {
     });
   });
 
+  private screenWatcher: {
+    currentDisplay: Display;
+    timer: any;
+    watching: boolean;
+  } = {
+    currentDisplay: null as unknown as Display,
+    timer: null,
+    watching: false,
+  };
+
   constructor(opts?: ScreenshotsOpts) {
     super();
     this.logger = opts?.logger || debug('electron-screenshots');
@@ -91,13 +102,76 @@ export default class Screenshots extends Events {
     await this.createWindow(display);
 
     this.$view.webContents.send('SCREENSHOTS:capture', display, imageUrl);
+
+    // 启动屏幕监听
+    this.startScreenWatcher(display);
   }
 
+
+  private startScreenWatcher(initialDisplay: Display) {
+    if (this.screenWatcher.watching) return;
+
+    this.screenWatcher.currentDisplay = initialDisplay;
+    this.screenWatcher.watching = true;
+
+    const checkScreen = async () => {
+      if (!this.screenWatcher.watching || !this.$win || this.$win.isDestroyed()) {
+        this.stopScreenWatcher();
+        return;
+      }
+
+      const point = screen.getCursorScreenPoint();
+      const newDisplay = screen.getDisplayNearestPoint(point);
+
+      if (newDisplay.id !== this.screenWatcher.currentDisplay.id) {
+        const display: Display = {
+          id: newDisplay.id,
+          x: Math.floor(newDisplay.bounds.x),
+          y: Math.floor(newDisplay.bounds.y),
+          width: Math.floor(newDisplay.bounds.width),
+          height: Math.floor(newDisplay.bounds.height),
+          scaleFactor: newDisplay.scaleFactor,
+        };
+
+        this.screenWatcher.currentDisplay = display;
+
+        // 预加载新屏幕的截图
+        const imageUrl = await this.capture(display);
+
+        // 更新窗口和视图
+        this.$win.setBounds(display);
+        this.$view.setBounds({
+          x: 0,
+          y: 0,
+          width: display.width,
+          height: display.height,
+        });
+
+        // 发送新的截图数据
+        this.$view.webContents.send('SCREENSHOTS:capture', display, imageUrl);
+      }
+
+      // 使用 requestAnimationFrame 的思想控制检查频率
+      this.screenWatcher.timer = setTimeout(checkScreen, 100);
+    };
+
+    checkScreen();
+  }
+
+  private stopScreenWatcher() {
+    if (this.screenWatcher.timer) {
+      clearTimeout(this.screenWatcher.timer);
+      this.screenWatcher.timer = null;
+    }
+    this.screenWatcher.watching = false;
+  }
   /**
    * 结束截图
    */
   public async endCapture(): Promise<void> {
     this.logger('endCapture');
+    // 停止屏幕监听
+    this.stopScreenWatcher();
     await this.reset();
 
     if (!this.$win) {
@@ -311,6 +385,22 @@ export default class Screenshots extends Events {
    * 绑定ipc时间处理
    */
   private listenIpc(): void {
+    
+    /**
+     * 开始截图窗口，停止屏幕监听
+     */
+    ipcMain.on('SCREENSHOTS:start', () => {
+      this.logger('SCREENSHOTS:start');
+      this.stopScreenWatcher();
+    });
+
+    /**
+     * 停止截图窗口，重新开启屏幕监听
+     */
+    ipcMain.on('SCREENSHOTS:stop', (e, display: Display) => {
+      this.logger('SCREENSHOTS:stop');
+      this.startScreenWatcher(display);
+    });
     /**
      * OK事件
      */

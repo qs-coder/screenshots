@@ -23,6 +23,14 @@ export interface ScreenshotsData {
 const map = new Map<ScreenshotsListener, Record<string, IpcRendererListener>>();
 
 contextBridge.exposeInMainWorld('screenshots', {
+  start: () => {
+    console.log('contextBridge start');
+    ipcRenderer.send('SCREENSHOTS:start');
+  },
+  stop: (display: Display) => {
+    console.log('contextBridge stop');
+    ipcRenderer.send('SCREENSHOTS:stop', display);
+  },
   ready: () => {
     console.log('contextBridge ready');
 

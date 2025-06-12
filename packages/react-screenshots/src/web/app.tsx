@@ -16,6 +16,13 @@ export default function App (): ReactElement {
   const onCancel = useCallback(() => {
     console.log('cancel')
   }, [])
+  const onStart = useCallback(() => {
+    console.log('start')
+  }, [])
+
+  const onStop = useCallback(() => {
+    console.log('stop')
+  }, [])
   const onOk = useCallback((blob: Blob | null, bounds: Bounds) => {
     console.log('ok', blob, bounds)
     if (blob) {
@@ -37,6 +44,8 @@ export default function App (): ReactElement {
         onSave={onSave}
         onCancel={onCancel}
         onOk={onOk}
+        onStart={onStart}
+        onStop={onStop}
       />
     </div>
   )

@@ -133,6 +133,14 @@ export default function Screenshots ({ url, width, height, lang, className, ...p
     [call]
   )
 
+  const onStart = useCallback(
+    () => call('onStart'), []
+  )
+
+  const onStop = useCallback(
+    () => call('onStop'), []
+  )
+
   // url变化，重置截图区域
   useLayoutEffect(() => {
     reset()
@@ -146,7 +154,7 @@ export default function Screenshots ({ url, width, height, lang, className, ...p
         onDoubleClick={onDoubleClick}
         onContextMenu={onContextMenu}
       >
-        <ScreenshotsBackground />
+        <ScreenshotsBackground onStart={onStart} onStop={onStop} />
         <ScreenshotsCanvas ref={canvasContextRef} />
         <ScreenshotsOperations />
       </div>

@@ -1,5 +1,5 @@
 {
-  "name": "react-screenshots",
+  "name": "@qs-coder/react-screenshots",
   "version": "0.5.22",
   "description": "a screenshot cropper tool by react",
   "main": "./lib/react-screenshots.cjs.js",
@@ -22,19 +22,19 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nashaofu/screenshots.git"
+    "url": "git+https://github.com/qs-coder/screenshots.git"
   },
   "keywords": [
     "screenshot",
     "cropper",
     "react"
   ],
-  "author": "nashaofu",
+  "author": "qs-coder",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/nashaofu/screenshots/issues"
+    "url": "https://github.com/qs-coder/screenshots/issues"
   },
-  "homepage": "https://github.com/nashaofu/screenshots/tree/master/packages/react-screenshots#readme",
+  "homepage": "https://github.com/qs-coder/screenshots/tree/master/packages/react-screenshots#readme",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/"
   },

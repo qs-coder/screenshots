@@ -5,8 +5,12 @@ import ScreenshotsMagnifier from '../ScreenshotsMagnifier'
 import { Point, Position } from '../types'
 import getBoundsByPoints from './getBoundsByPoints'
 import './index.less'
-
-export default memo(function ScreenshotsBackground (): ReactElement | null {
+// 添加组件 props 接口
+interface ScreenshotsBackgroundProps {
+  onStart?: () => void
+  onStop?: () => void
+}
+export default memo(function ScreenshotsBackground ({ onStart, onStop }: ScreenshotsBackgroundProps): ReactElement | null {
   const { url, image, width, height } = useStore()
   const [bounds, boundsDispatcher] = useBounds()
 
@@ -53,8 +57,9 @@ export default memo(function ScreenshotsBackground (): ReactElement | null {
         y: e.clientY
       }
       isMoveRef.current = false
+      onStart && onStart()
     },
-    [bounds]
+    [bounds, onStart]
   )
 
   useEffect(() => {
@@ -87,10 +92,13 @@ export default memo(function ScreenshotsBackground (): ReactElement | null {
       }
 
       if (isMoveRef.current) {
+        onStart && onStart()
         updateBounds(pointRef.current, {
           x: e.clientX,
           y: e.clientY
         })
+      } else {
+        onStop && onStop()
       }
       pointRef.current = null
       isMoveRef.current = false
@@ -102,7 +110,7 @@ export default memo(function ScreenshotsBackground (): ReactElement | null {
       window.removeEventListener('mousemove', onMouseMove)
       window.removeEventListener('mouseup', onMouseUp)
     }
-  }, [updateBounds])
+  }, [updateBounds, onStart, onStop])
 
   useLayoutEffect(() => {
     if (!image || bounds) {
