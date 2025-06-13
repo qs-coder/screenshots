@@ -82,7 +82,7 @@ export default class Screenshots extends Events {
     this.singleWindow = opts?.singleWindow || false;
     this.listenIpc();
     this.$view.webContents.loadURL(
-      `file://${require.resolve('react-screenshots/electron/electron.html')}`,
+      `file://${require.resolve('@qs-coder/react-screenshots/electron/electron.html')}`,
     );
     if (opts?.lang) {
       this.setLang(opts.lang);
