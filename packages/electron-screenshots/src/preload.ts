@@ -27,9 +27,9 @@ contextBridge.exposeInMainWorld('screenshots', {
     console.log('contextBridge start');
     ipcRenderer.send('SCREENSHOTS:start');
   },
-  stop: (display: Display) => {
+  stop: () => {
     console.log('contextBridge stop');
-    ipcRenderer.send('SCREENSHOTS:stop', display);
+    ipcRenderer.send('SCREENSHOTS:stop');
   },
   ready: () => {
     console.log('contextBridge ready');

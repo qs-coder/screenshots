@@ -38,11 +38,8 @@ export default function App (): JSX.Element {
   }, [])
 
   const onStop = useCallback(() => {
-    if (!display) {
-      return
-    }
-    window.screenshots.stop(display)
-  }, [display])
+    window.screenshots.stop()
+  }, [])
 
   const onOk = useCallback(
     async (blob: Blob | null, bounds: Bounds) => {

@@ -71,10 +71,10 @@ export default class Screenshots extends Events {
     timer: any;
     watching: boolean;
   } = {
-    currentDisplay: null as unknown as Display,
-    timer: null,
-    watching: false,
-  };
+      currentDisplay: null as unknown as Display,
+      timer: null,
+      watching: false,
+    };
 
   constructor(opts?: ScreenshotsOpts) {
     super();
@@ -106,7 +106,6 @@ export default class Screenshots extends Events {
     // 启动屏幕监听
     this.startScreenWatcher(display);
   }
-
 
   private startScreenWatcher(initialDisplay: Display) {
     if (this.screenWatcher.watching) return;
@@ -165,6 +164,7 @@ export default class Screenshots extends Events {
     }
     this.screenWatcher.watching = false;
   }
+
   /**
    * 结束截图
    */
@@ -385,7 +385,6 @@ export default class Screenshots extends Events {
    * 绑定ipc时间处理
    */
   private listenIpc(): void {
-    
     /**
      * 开始截图窗口，停止屏幕监听
      */
@@ -397,8 +396,11 @@ export default class Screenshots extends Events {
     /**
      * 停止截图窗口，重新开启屏幕监听
      */
-    ipcMain.on('SCREENSHOTS:stop', (e, display: Display) => {
+    ipcMain.on('SCREENSHOTS:stop', () => {
       this.logger('SCREENSHOTS:stop');
+      console.log('SCREENSHOTS:stop');
+      this.stopScreenWatcher();
+      const display = getDisplay();
       this.startScreenWatcher(display);
     });
     /**
