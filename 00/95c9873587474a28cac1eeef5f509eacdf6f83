@@ -1,0 +1,180 @@
+packages/electron-screenshots/package.json
+  s_fe63a2acd1c7d9::t_b87ffaf956e8d7 3
+  s_fe63a2acd1c7d9::t_255c4daf9b6ba2 42
+  s_fe63a2acd1c7d9::t_88c7e0996f3b1c 39-41
+  s_fe63a2acd1c7d9::t_88620a2d3bf938 8,16,45,48-54
+packages/react-screenshots/package.json
+  s_fe63a2acd1c7d9::t_b93498bfcfe485 3
+  s_fe63a2acd1c7d9::t_a4d5823302dfc2 5-18,21,24-27,48-49,52-61
+.github/workflows/deploy-docs.yml
+  s_fe63a2acd1c7d9::t_88ea7f675203bd 10-13,19-20,22-23,25-31,33-34,36
+biome.json
+  s_fe63a2acd1c7d9::t_9c8ee4b172768e 1-20,22-25,27-33,36
+package.json
+  s_fe63a2acd1c7d9::t_adb2992c0c7648 3,6,9-13,16
+packages/electron-screenshots/src/demo.ts
+  s_fe63a2acd1c7d9::t_c49d32614e553d 3,38,50
+packages/electron-screenshots/src/getDisplay.ts
+  s_fe63a2acd1c7d9::t_137615651ca363 1,4-5
+packages/electron-screenshots/src/padStart.ts
+  s_fe63a2acd1c7d9::t_a82a38fd8b824b 8-12
+packages/electron-screenshots/src/preload.ts
+  s_fe63a2acd1c7d9::t_1af32207af1960 2-3,62
+packages/electron-screenshots/tsconfig.json
+  s_fe63a2acd1c7d9::t_e6ea4434dbaf16 2,4-6,8-16,18-21,23-25,27-33,35-42
+packages/react-screenshots/.gitignore
+  s_fe63a2acd1c7d9::t_16a5c4d0ae8d6d 1-17
+packages/react-screenshots/rsbuild.config.ts
+  s_fe63a2acd1c7d9::t_0bd9c23030fc2a 1-11,13-14,16-17
+packages/react-screenshots/rslib.config.ts
+  s_fe63a2acd1c7d9::t_89cc28877d546c 1-9,11-16,18-23
+packages/react-screenshots/src/Screenshots/ScreenshotsBackground/getBoundsByPoints.ts
+  s_fe63a2acd1c7d9::t_6d4f640621a153 1,3,7,11,15,20,24,28,32,39-40
+packages/react-screenshots/src/Screenshots/ScreenshotsButton/index.tsx
+  s_fe63a2acd1c7d9::t_97a4653ae75d98 1-4,15,21,23,28,30,32-33,36,39,52-53
+packages/react-screenshots/src/Screenshots/ScreenshotsCanvas/getBoundsByPoints.ts
+  s_fe63a2acd1c7d9::t_4cd7d3b911228e 1,3,9,13,17,22,24,29,31,36,38,43,45,53-54
+packages/react-screenshots/src/Screenshots/ScreenshotsCanvas/getPoints.ts
+  s_fe63a2acd1c7d9::t_1c54a76c81e5f5 1,3-14,18-19,21-23,25-26,28-30,32-33,35-37,39-40,42-44,46-50,52,58,62-64
+packages/react-screenshots/src/Screenshots/ScreenshotsCanvas/index.tsx
+  s_fe63a2acd1c7d9::t_91e6ae324da839 1-2,9-22,24,27-35,46-47,50-51,54,56-60,62-66,68,70,73,76-77,79-80,84,86-87,89-90,92,95,98-99,104-105,112,114,116,120-121,124,131,138,148,151,155-156,160,163-164,167,174,176,178,180,182,189,191-194,196,198-200,203-206,212,216,222,225,228,235,240,246,248,250,253,264,272,274,277,279
+packages/react-screenshots/src/Screenshots/ScreenshotsCanvas/isPointInDraw.ts
+  s_fe63a2acd1c7d9::t_854bf1e64e8fb7 1-2,4,8,11,14-17,20,23-25,27,29,31,33-35
+packages/react-screenshots/src/Screenshots/ScreenshotsColor/index.tsx
+  s_fe63a2acd1c7d9::t_0655d6464da2c0 1-3,6-7,10-21,23-25,27,34,36,39-40
+packages/react-screenshots/src/Screenshots/ScreenshotsContext.ts
+  s_fe63a2acd1c7d9::t_15fb83047094ba 1-5,8-18,22-26,30-31,41,45,49,56-58
+packages/react-screenshots/src/Screenshots/ScreenshotsMagnifier/index.tsx
+  s_fe63a2acd1c7d9::t_6fd40b10e8fee3 1-5,8-9,12-13,15-25,29,31-33,35,38,42,45,49-51,55-56,60,63,66-69,80-87,89,91,93-94,99,101,104,107,112-113,116,119-120
+packages/react-screenshots/src/Screenshots/ScreenshotsOperations/index.tsx
+  s_fe63a2acd1c7d9::t_f6029c95b89264 1-7,9-11,13-17,19,21-22,25-27,32,35,37-38,41,45,49,53-57,60-61,76-77,79,82,89,92,97,100-103,105-106,112-113
+packages/react-screenshots/src/Screenshots/ScreenshotsOption/index.tsx
+  s_fe63a2acd1c7d9::t_533ee7a770cb33 1-13,16-18,21,24-25,28-39,43,45-46,48,50,52,55-57,61-67,70-71,73-76,80-82,87-89,95,97,102,104,107,112-113,117,119,123-128,134,136-139,143-147,152-153
+packages/react-screenshots/src/Screenshots/ScreenshotsSize/index.tsx
+  s_fe63a2acd1c7d9::t_742001c870030d 1-3,6-7,10-14,16-18,21,25-29,31,34,38,41-42
+packages/react-screenshots/src/Screenshots/ScreenshotsSizeColor/index.tsx
+  s_fe63a2acd1c7d9::t_8777383dc3490a 1-4,7-10,13,17,20,24-25
+packages/react-screenshots/src/Screenshots/ScreenshotsTextarea/calculateNodeSize.ts
+  s_fe63a2acd1c7d9::t_014a7474ec45ab 14,33-34,37-40,44-45,48,50-51,56,59-60,63-64,66-68,74-75,78,82,85-87,92-93,100-101,103,105-106,110-111,114-115,120-121
+packages/react-screenshots/src/Screenshots/ScreenshotsTextarea/index.tsx
+  s_fe63a2acd1c7d9::t_36928b7a28a464 1-5,8-16,19,28,30-33,37,39-40,44,46-47,51-53,57,60-68,73,82,85-86,88-90
+packages/react-screenshots/src/Screenshots/composeImage.ts
+  s_fe63a2acd1c7d9::t_e007f0efb7f25a 1-2,5-9,12-18,20-24,26,28,31-32,34,36-45,55-56,58,60,62,64,66,68-70
+packages/react-screenshots/src/Screenshots/exports.ts
+  s_fe63a2acd1c7d9::t_da7663bdd4d9c3 1-4
+packages/react-screenshots/src/Screenshots/hooks/useBounds.ts
+  s_fe63a2acd1c7d9::t_64195f6dfe4e63 1-4,7-8,11,13-15,19,21-22,25-26,32-34
+packages/react-screenshots/src/Screenshots/hooks/useCall.ts
+  s_fe63a2acd1c7d9::t_3c946f0d26c113 1-2,4-7,9-10,14,16-17,19
+packages/react-screenshots/src/Screenshots/hooks/useCanvasContextRef.ts
+  s_fe63a2acd1c7d9::t_8df4f716574792 1-2,4-5,7
+packages/react-screenshots/src/Screenshots/hooks/useCanvasPointerDown.ts
+  s_fe63a2acd1c7d9::t_71916ecd4c7f4e 1-2,4-7,10,12-14
+packages/react-screenshots/src/Screenshots/hooks/useCanvasPointerMove.ts
+  s_fe63a2acd1c7d9::t_cd6f972874376b 1-2,4-7,10,12-14
+packages/react-screenshots/src/Screenshots/hooks/useCanvasPointerUp.ts
+  s_fe63a2acd1c7d9::t_c79c7326346f68 1-2,4-7,10,12-14
+packages/react-screenshots/src/Screenshots/hooks/useCursor.ts
+  s_fe63a2acd1c7d9::t_bf930c4b7cc36e 1-3,12-14,18,20-21,24-25,31-33
+packages/react-screenshots/src/Screenshots/hooks/useDispatcher.ts
+  s_fe63a2acd1c7d9::t_00c0a27ba31c1d 1-3,5-6,8
+packages/react-screenshots/src/Screenshots/hooks/useDrawSelect.ts
+  s_fe63a2acd1c7d9::t_808b478958c48b 1-3,5-9,11,14,16-18
+packages/react-screenshots/src/Screenshots/hooks/useEmitter.ts
+  s_fe63a2acd1c7d9::t_f1ed2e752336a0 1-9,12-13,16-19,21,24-25,28-31,33,37-38,42,44-47,50-51,54-55,61-62
+packages/react-screenshots/src/Screenshots/hooks/useHistory.ts
+  s_fe63a2acd1c7d9::t_65502ca35734db 1-5,8,12-19,22,24-26,30,32,34,36,39,41,44-45,49-50,52-53,56,58,62-64,67,69,73,75,81-83,86,88,92,94,100-102,106,108-109,113,116,118,121-122,124-125,128,130,132,134-135,140-142,148,158-160
+packages/react-screenshots/src/Screenshots/hooks/useLang.ts
+  s_fe63a2acd1c7d9::t_f6a2e9040f4aa5 1-2,4-5,7
+packages/react-screenshots/src/Screenshots/hooks/useOperation.ts
+  s_fe63a2acd1c7d9::t_afe7764bbdfc77 1-3,12,15-17,21,23-24,27-28,34-36
+packages/react-screenshots/src/Screenshots/hooks/useReset.ts
+  s_fe63a2acd1c7d9::t_0cce9d9729dcdb 1-6,8,10-15,18-29,31
+packages/react-screenshots/src/Screenshots/hooks/useStore.ts
+  s_fe63a2acd1c7d9::t_43600a66569528 1-3,5-6,8
+packages/react-screenshots/src/Screenshots/index.tsx
+  s_fe63a2acd1c7d9::t_2537b11e6e9a07 1-13,16-21,24-36,39-43,52,54,59-60,64,66,69-70,77-78,80,83,86-87,90-95,98,100,108-112,118-119,125-129,132-133,136,138,140-142,144-145,156,158-159,174
+packages/react-screenshots/src/Screenshots/operations/Arrow/draw.ts
+  s_fe63a2acd1c7d9::t_3755ab2e70136b 1-4,6-9,11-12,14-17,19-20,22-23,25,31-32,35-43,45-46,48-62,65-66
+packages/react-screenshots/src/Screenshots/operations/Arrow/index.tsx
+  s_fe63a2acd1c7d9::t_90b8545ddd0c01 1-17,20-25,31,35-39,42-57,60-62,66,68-70,73,75,78-79,81-82,86,89,93,96,106,108-109,111,113-114,116-117,119,122-123,133,137-138,140-141,143-144,146,149-150,152-153,155,158-159,161-162,165,167,171-172,174,176,180,183-185,187-190,195,198-205,207
+packages/react-screenshots/src/Screenshots/operations/Brush/draw.ts
+  s_fe63a2acd1c7d9::t_932f3e99f4980d 1-2,4-12,17,19-20,22,25,27,29-30,33-35,38,40,42-43
+packages/react-screenshots/src/Screenshots/operations/Brush/index.tsx
+  s_fe63a2acd1c7d9::t_6340ebc94931ff 1-17,20-22,26-29,32-47,50-52,56,58-60,63,65,68,76,78-79,81,83-84,86-87,89,92-93,104-106,110-111,113-114,116-117,119,123-124,126-127,129,132-133,137-138,141,143,147-148,150,152,156,159-161,163-166,171,174-181,183
+packages/react-screenshots/src/Screenshots/operations/Cancel/index.tsx
+  s_fe63a2acd1c7d9::t_cecd8b12194b85 1-6,8-11,14-16,18-24
+packages/react-screenshots/src/Screenshots/operations/Ellipse/draw.ts
+  s_fe63a2acd1c7d9::t_a01334e3785195 1-4,6-9,12-13,15-18,20,22-23,25,27-28,30,32-33,35,37-38,40,47-48,51-59,61-65,67,69,71-78,81-83,85-91,93-100
+packages/react-screenshots/src/Screenshots/operations/Ellipse/index.tsx
+  s_fe63a2acd1c7d9::t_43b275d0f4b0ee 1-17,20-25,37,41-45,48-63,65,68-70,74,76-78,81,83,86,88,90,92,96,99,103,106,110,113,117,120,124,127,131,134,138,141,145,148,158,160-161,163,165-166,168-169,171,174-177,187,191-192,194-195,197-198,200,204-205,207-210,212,215-218,221,223,227-228,230,232,236,239-241,243-246,251,254-261,263
+packages/react-screenshots/src/Screenshots/operations/Mosaic/index.tsx
+  s_fe63a2acd1c7d9::t_7db802684515cc 1-16,19-21,25-26,29,31,33,35,37,40-53,56-66,68,71-73,77,79-91,94-97,107-109,112-113,115-126,129-131,133-134,136,142-143,145-146,148-150,153-154,158-161,169-170,175,177,180-181,183,185,188-189,191-193,197,200,202,205,208-209,211-212,223-224,226-232,237,242
+packages/react-screenshots/src/Screenshots/operations/Ok/index.tsx
+  s_fe63a2acd1c7d9::t_0c014a99adac61 1-9,11-16,19,22,29-45,47-53
+packages/react-screenshots/src/Screenshots/operations/Rectangle/draw.ts
+  s_fe63a2acd1c7d9::t_de5346310c8825 1-4,6-9,12-13,15-18,20,22-23,25,27-28,30,32-33,35,37-38,40,47-48,51,53,55-59,61-67,70-72,74-81
+packages/react-screenshots/src/Screenshots/operations/Rectangle/index.tsx
+  s_fe63a2acd1c7d9::t_3da90c803dcf73 1-17,20-25,37,41-45,48-63,65,68-70,74,76-78,81,83,86-90,92,94,98,101,105,108,112,115,119,122,126,129,133,136,140,143,147,150,160,162-163,165,167-168,170-171,173,176-179,189,193-194,196-197,199-200,202,206-207,209-212,214,217-221,224,226,230-231,233,235,239,242-244,246-249,254,257-264,266
+packages/react-screenshots/src/Screenshots/operations/Redo/index.tsx
+  s_fe63a2acd1c7d9::t_41a67e889cfffe 1-5,7-9,12-13,18-21,24
+packages/react-screenshots/src/Screenshots/operations/Save/index.tsx
+  s_fe63a2acd1c7d9::t_dfa6247c5acffb 1-9,11-16,19,22,29-45,47-53
+packages/react-screenshots/src/Screenshots/operations/Text/index.tsx
+  s_fe63a2acd1c7d9::t_57e5de80d0402b 1-17,45-46,48,50,52-56,61,63-64,67-68,71,74,76-78,80-81,84,86,88-89,94,96-97,99-102,106,109-117,119-120,122-123,125-127,129,132-134,138,140-142,146,148-149,153,155-156,160,162,165-166,169-170,172-175,178,180,183,191,193-194,196,198-199,201-202,204,207,209-212,223,227-228,234-235,237-238,240-241,243,247-248,250-251,253,257-258,260,262,265-266,268-271,277,303
+packages/react-screenshots/src/Screenshots/operations/Undo/index.tsx
+  s_fe63a2acd1c7d9::t_4cab8ae28c3ce1 1-5,7-9,12-13,18,22
+packages/react-screenshots/src/Screenshots/operations/index.ts
+  s_fe63a2acd1c7d9::t_4dbf1dd3dd5c5c 1-11,13-27
+packages/react-screenshots/src/Screenshots/operations/utils.ts
+  s_fe63a2acd1c7d9::t_503885fd60cd5d 1-17,20-27,30-34,36,39,41-42,45
+packages/react-screenshots/src/Screenshots/types.ts
+  s_fe63a2acd1c7d9::t_1dd074cb868e2d 1,3-4,6-7,9,11,14-15,20,24-26,30-43,46,49-51,55-58,61
+packages/react-screenshots/src/Screenshots/useGetLoadedImage.ts
+  s_fe63a2acd1c7d9::t_7093956267c90b 1,3-6,10,12,15,17-18,20-22,25-28,30
+packages/react-screenshots/src/Screenshots/zh_CN.ts
+  s_fe63a2acd1c7d9::t_e62a7057a8484c 2-13,28-29,31
+packages/react-screenshots/src/electron/app.tsx
+  s_fe63a2acd1c7d9::t_35730ce44ed298 1-6,9-13,16-21,26,28,30-31,34-35,48,50,52-53,57-58,61-63,66-67,69-70,72-74,76,78-82,86-88,90,92-94,97,110
+packages/react-screenshots/src/electron/index.tsx
+  s_fe63a2acd1c7d9::t_698cf7bda68134 1-3,5,8-9
+packages/react-screenshots/src/env.d.ts
+  s_fe63a2acd1c7d9::t_5496adfcadfdf8 1-11
+packages/react-screenshots/src/web/index.tsx
+  s_fe63a2acd1c7d9::t_855cd1fef2b7fc 1-3,5,8-9
+packages/react-screenshots/tsconfig.json
+  s_fe63a2acd1c7d9::t_e6fc8aebc0d6ea 3-22,24
+pnpm-lock.yaml
+  s_fe63a2acd1c7d9::t_aade68e5d92d56 1-1535
+pnpm-workspace.yaml
+  s_fe63a2acd1c7d9::t_7949dc08ac4bf9 1-5
+packages/electron-screenshots/src/index.ts
+  s_fe63a2acd1c7d9::t_eb71e0d9385081 1-2,7,15-18,44,86,246,320-327,357-358,362,371-373,449-456,458-466,486
+packages/react-screenshots/src/Screenshots/ScreenshotsBackground/index.tsx
+  s_fe63a2acd1c7d9::t_997e12ee5d57b7 1-16,19-20,23-28,30-32,37,39,45,49,54,57,59-60,63,67-70,73,76,78-85,89-90,95,99-102,104,106,110,113-114,116,118-122,125-128,133,135,139,143-152,154-155
+packages/react-screenshots/src/global.d.ts
+  s_fe63a2acd1c7d9::t_d7551396cb124c 1-2,4,7-8,12-20,25
+packages/react-screenshots/src/web/app.tsx
+  s_fe63a2acd1c7d9::t_2b001919b4d44d 1-6,8,10,12-14,16,18-19,21-22,25-26,28,30-32,34,37,43,52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "0095c9873587474a28cac1eeef5f509eacdf6f83",
+  "prompts": {},
+  "humans": {
+    "h_b66c7b30fc5084": {
+      "author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  },
+  "sessions": {
+    "s_fe63a2acd1c7d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "045b7165-d522-4511-84d1-c685b8cbc409",
+        "model": "glm-5.2"
+      },
+      "human_author": null
+    }
+  }
+}
