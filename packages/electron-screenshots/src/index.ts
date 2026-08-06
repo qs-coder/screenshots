@@ -362,10 +362,46 @@ export default class Screenshots extends Events {
       if (sources.length === 1) {
         [source] = sources;
       } else {
+        // 策略1: 通过 display_id 或 id 匹配
         source = sources.find(
           (item) => item.display_id === display.id.toString()
             || item.id.startsWith(`screen:${display.id}:`),
         );
+
+        // 策略2: 如果ID匹配失败，通过thumbnail尺寸匹配（适用于Win7等系统）
+        // 因为thumbnailSize是根据display尺寸设置的，匹配的source应该有相同的尺寸
+        if (!source) {
+          const expectedWidth = display.width * display.scaleFactor;
+          const expectedHeight = display.height * display.scaleFactor;
+          source = sources.find((item) => {
+            if (!item.thumbnail) return false;
+            const size = item.thumbnail.getSize();
+            // 允许小误差（1像素）处理舍入问题
+            return Math.abs(size.width - expectedWidth) <= 1
+              && Math.abs(size.height - expectedHeight) <= 1;
+          });
+        }
+
+        // 策略3: 如果尺寸匹配也失败，在Windows系统上通过cursor位置匹配
+        if (!source && process.platform === 'win32') {
+          const cursorPoint = screen.getCursorScreenPoint();
+          const nearestDisplay = screen.getDisplayNearestPoint(cursorPoint);
+          // 如果当前display是cursor所在的显示器，尝试通过name匹配或使用第一个source
+          if (nearestDisplay.id === display.id) {
+            // 某些系统上，source的name可能包含显示器信息
+            source = sources.find((item) => item.name && item.name.includes(display.id.toString()));
+            // 如果name匹配也失败，使用第一个source作为fallback
+            if (!source) {
+              [source] = sources;
+            }
+          }
+        }
+
+        // 策略4: 最后的fallback - 如果所有匹配都失败，使用第一个source
+        // 这在单显示器系统或匹配逻辑完全失败时至少能工作
+        if (!source && sources.length > 0) {
+          [source] = sources;
+        }
       }
 
       if (!source) {
@@ -398,7 +434,6 @@ export default class Screenshots extends Events {
      */
     ipcMain.on('SCREENSHOTS:stop', () => {
       this.logger('SCREENSHOTS:stop');
-      console.log('SCREENSHOTS:stop');
       this.stopScreenWatcher();
       const display = getDisplay();
       this.startScreenWatcher(display);
