@@ -42,7 +42,8 @@
   },
   "homepage": "https://github.com/qs-coder/screenshots/tree/master/packages/react-screenshots#readme",
   "publishConfig": {
-    "registry": "https://registry.npmjs.org/"
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
   },
   "peerDependencies": {
     "react": ">=16.9.0",

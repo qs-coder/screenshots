@@ -33,7 +33,8 @@
   },
   "homepage": "https://github.com/qs-coder/screenshots/tree/master/packages/electron-screenshots#readme",
   "publishConfig": {
-    "registry": "https://registry.npmjs.org/"
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
   },
   "dependencies": {
     "debug": "^4.4.3",
