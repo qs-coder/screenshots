@@ -1,0 +1,28 @@
+.github/workflows/publish.yml
+  s_fe63a2acd1c7d9::t_110714f815894c 1-40
+packages/electron-screenshots/package.json
+  s_fe63a2acd1c7d9::t_1ac31c526e96c9 36-37
+packages/react-screenshots/package.json
+  s_fe63a2acd1c7d9::t_c8a7fda05cefd8 45-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "115fe79babf431b4bbbb506be3e81f2b802379d7",
+  "prompts": {},
+  "humans": {
+    "h_b66c7b30fc5084": {
+      "author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  },
+  "sessions": {
+    "s_fe63a2acd1c7d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "045b7165-d522-4511-84d1-c685b8cbc409",
+        "model": "glm-5.2"
+      },
+      "human_author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  }
+}
