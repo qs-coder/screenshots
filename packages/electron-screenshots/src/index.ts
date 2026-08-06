@@ -1,20 +1,21 @@
-import debug, { Debugger } from 'debug';
+import Events from 'node:events';
+import debug, { type Debugger } from 'debug';
 import {
   BrowserView,
   BrowserWindow,
   clipboard,
+  type DesktopCapturerSource,
   desktopCapturer,
   dialog,
   ipcMain,
   nativeImage,
   screen,
 } from 'electron';
-import Events from 'events';
 import fs from 'fs-extra';
-import Event from './event';
-import getDisplay, { Display } from './getDisplay';
-import padStart from './padStart';
-import { Bounds, ScreenshotsData } from './preload';
+import Event from './event.js';
+import getDisplay, { type Display } from './getDisplay.js';
+import padStart from './padStart.js';
+import type { Bounds, ScreenshotsData } from './preload.js';
 
 export type LoggerFn = (...args: unknown[]) => void;
 export type Logger = Debugger | LoggerFn;
@@ -40,7 +41,7 @@ export interface ScreenshotsOpts {
   singleWindow?: boolean;
 }
 
-export { Bounds };
+export type { Bounds };
 
 export default class Screenshots extends Events {
   // 截图窗口对象
@@ -82,7 +83,7 @@ export default class Screenshots extends Events {
     this.singleWindow = opts?.singleWindow || false;
     this.listenIpc();
     this.$view.webContents.loadURL(
-      `file://${require.resolve('@qs-coder/react-screenshots/electron/electron.html')}`,
+      `file://${require.resolve('@qs-coder/react-screenshots/dist/electron.html')}`,
     );
     if (opts?.lang) {
       this.setLang(opts.lang);
@@ -242,7 +243,7 @@ export default class Screenshots extends Events {
         width: display.width,
         height: display.height,
         useContentSize: true,
-        type: windowTypes[process.platform],
+        type: windowTypes[process.platform] as string,
         frame: false,
         show: false,
         autoHideMenuBar: true,
@@ -316,10 +317,14 @@ export default class Screenshots extends Events {
 
     try {
       const { Monitor } = await import('node-screenshots');
-      const monitor = Monitor.fromPoint(
-        display.x + display.width / 2,
-        display.y + display.height / 2,
-      );
+      let point = {
+        x: display.x + display.width / 2,
+        y: display.y + display.height / 2,
+      };
+      if (process.platform === 'win32') {
+        point = screen.screenToDipPoint(point);
+      }
+      const monitor = Monitor.fromPoint(point.x, point.y);
       this.logger(
         'SCREENSHOTS:capture Monitor.fromPoint arguments %o',
         display,
@@ -346,16 +351,15 @@ export default class Screenshots extends Events {
       return `data:image/png;base64,${buffer.toString('base64')}`;
     } catch (err) {
       this.logger('SCREENSHOTS:capture Monitor capture() error %o', err);
-
       const sources = await desktopCapturer.getSources({
         types: ['screen'],
         thumbnailSize: {
-          width: display.width * display.scaleFactor,
-          height: display.height * display.scaleFactor,
+          width: Math.floor(display.width * display.scaleFactor),
+          height: Math.floor(display.height * display.scaleFactor),
         },
       });
 
-      let source;
+      let source: DesktopCapturerSource | undefined;
       // Linux系统上，screen.getDisplayNearestPoint 返回的 Display 对象的 id
       // 和这里 source 对象上的 display_id(Linux上，这个值是空字符串) 或 id 的中间部分，都不一致
       // 但是，如果只有一个显示器的话，其实不用判断，直接返回就行
@@ -364,8 +368,9 @@ export default class Screenshots extends Events {
       } else {
         // 策略1: 通过 display_id 或 id 匹配
         source = sources.find(
-          (item) => item.display_id === display.id.toString()
-            || item.id.startsWith(`screen:${display.id}:`),
+          (item) =>
+            item.display_id === display.id.toString() ||
+            item.id.startsWith(`screen:${display.id}:`),
         );
 
         // 策略2: 如果ID匹配失败，通过thumbnail尺寸匹配（适用于Win7等系统）
@@ -441,21 +446,24 @@ export default class Screenshots extends Events {
     /**
      * OK事件
      */
-    ipcMain.on('SCREENSHOTS:ok', (e, buffer: Buffer, data: ScreenshotsData) => {
-      this.logger(
-        'SCREENSHOTS:ok buffer.length %d, data: %o',
-        buffer.length,
-        data,
-      );
+    ipcMain.on(
+      'SCREENSHOTS:ok',
+      (_event, buffer: Buffer, data: ScreenshotsData) => {
+        this.logger(
+          'SCREENSHOTS:ok buffer.length %d, data: %o',
+          buffer.length,
+          data,
+        );
 
-      const event = new Event();
-      this.emit('ok', event, buffer, data);
-      if (event.defaultPrevented) {
-        return;
-      }
-      clipboard.writeImage(nativeImage.createFromBuffer(buffer));
-      this.endCapture();
-    });
+        const event = new Event();
+        this.emit('ok', event, buffer, data);
+        if (event.defaultPrevented) {
+          return;
+        }
+        clipboard.writeImage(nativeImage.createFromBuffer(buffer));
+        this.endCapture();
+      },
+    );
     /**
      * CANCEL事件
      */
@@ -475,7 +483,7 @@ export default class Screenshots extends Events {
      */
     ipcMain.on(
       'SCREENSHOTS:save',
-      async (e, buffer: Buffer, data: ScreenshotsData) => {
+      async (_event, buffer: Buffer, data: ScreenshotsData) => {
         this.logger(
           'SCREENSHOTS:save buffer.length %d, data: %o',
           buffer.length,

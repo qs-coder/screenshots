@@ -1,6 +1,6 @@
 /* eslint-disable no-console */
-import { contextBridge, ipcRenderer, IpcRendererEvent } from 'electron';
-import { Display } from './getDisplay';
+import { contextBridge, type IpcRendererEvent, ipcRenderer } from 'electron';
+import type { Display } from './getDisplay.js';
 
 type IpcRendererListener = (
   event: IpcRendererEvent,
@@ -59,7 +59,7 @@ contextBridge.exposeInMainWorld('screenshots', {
   on: (channel: string, fn: ScreenshotsListener) => {
     console.log('contextBridge on', fn);
 
-    const listener = (event: IpcRendererEvent, ...args: unknown[]) => {
+    const listener = (_event: IpcRendererEvent, ...args: unknown[]) => {
       console.log('contextBridge on', channel, fn, ...args);
       fn(...args);
     };
