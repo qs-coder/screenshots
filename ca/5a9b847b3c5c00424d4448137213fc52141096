@@ -1,0 +1,20 @@
+lerna.json
+  h_b66c7b30fc5084 6
+packages/electron-screenshots/package.json
+  h_b66c7b30fc5084 3,42
+packages/electron-screenshots/src/index.ts
+  h_b66c7b30fc5084 365,370-404
+packages/react-screenshots/package.json
+  h_b66c7b30fc5084 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "ca5a9b847b3c5c00424d4448137213fc52141096",
+  "prompts": {},
+  "humans": {
+    "h_b66c7b30fc5084": {
+      "author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  }
+}
