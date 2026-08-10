@@ -1,0 +1,26 @@
+packages/electron-screenshots/src/index.ts
+  s_3109c4d107d3a9::t_56b11a1cd72847 279-281,283-284
+packages/electron-screenshots/package.json
+  s_3109c4d107d3a9::t_2b872c7e924d62 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "cce4f38a0673d7efb1213cb72095c34b70498d64",
+  "prompts": {},
+  "humans": {
+    "h_b66c7b30fc5084": {
+      "author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  },
+  "sessions": {
+    "s_3109c4d107d3a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f283d8b8-e62c-4acb-8332-bb9f6658b50e",
+        "model": "glm-5.2"
+      },
+      "human_author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  }
+}
