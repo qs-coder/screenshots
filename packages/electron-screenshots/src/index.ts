@@ -276,8 +276,12 @@ export default class Screenshots extends Events {
 
       this.emit('windowCreated', this.$win);
       this.$win.on('show', () => {
-        this.$win?.focus();
+        // 先完成 kiosk 过渡,再断言置顶,最后抢焦点
+        // 原顺序 focus()->setKiosk(true) 会在窗口已可见但置顶/焦点尚未最终断言时
+        // 留出脆弱窗口期,Windows 上偶发层级不在最上
         this.$win?.setKiosk(true);
+        this.$win?.setAlwaysOnTop(true);
+        this.$win?.focus();
       });
 
       this.$win.on('closed', () => {
