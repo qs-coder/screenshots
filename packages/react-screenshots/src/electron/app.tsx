@@ -19,6 +19,7 @@ export default function App(): ReactElement {
   const [height, setHeight] = useState(window.innerHeight);
   const [display, setDisplay] = useState<Display | undefined>(undefined);
   const [lang, setLang] = useState<Lang | undefined>(undefined);
+  const [windows, setWindows] = useState<Bounds[]>([]);
 
   const onSave = useCallback(
     async (blob: Blob | null, bounds: Bounds) => {
@@ -57,14 +58,20 @@ export default function App(): ReactElement {
       setLang(lang);
     };
 
-    const onCapture = (display: Display, dataURL: string) => {
+    const onCapture = (
+      display: Display,
+      dataURL: string,
+      windowBounds: Bounds[] = [],
+    ) => {
       setDisplay(display);
+      setWindows(windowBounds);
       setUrl(dataURL);
     };
 
     const onReset = () => {
       setUrl(undefined);
       setDisplay(undefined);
+      setWindows([]);
       // 确保截图区域被重置
       requestAnimationFrame(() => window.screenshots.reset());
     };
@@ -99,6 +106,7 @@ export default function App(): ReactElement {
         url={url}
         width={width}
         height={height}
+        windows={windows}
         lang={lang}
         onSave={onSave}
         onCancel={onCancel}

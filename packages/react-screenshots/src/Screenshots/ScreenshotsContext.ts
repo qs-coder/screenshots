@@ -14,6 +14,8 @@ export interface ScreenshotsContextStore {
   canvasContextRef: CanvasContextRef;
   history: History;
   bounds: Bounds | null;
+  /** 屏幕上其他应用的窗口矩形，屏幕内坐标系；拿不到时为空数组 */
+  windows: Bounds[];
   cursor?: string;
   operation?: string;
 }
@@ -45,6 +47,7 @@ export default React.createContext<ScreenshotsContextValue>({
       stack: [],
     },
     bounds: null,
+    windows: [],
     cursor: 'move',
     operation: undefined,
   },

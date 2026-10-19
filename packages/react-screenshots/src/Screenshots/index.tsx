@@ -18,6 +18,11 @@ export interface ScreenshotsProps {
   height: number;
   lang?: Partial<Lang>;
   className?: string;
+  /**
+   * 当前屏幕上其他应用的窗口矩形（屏幕内坐标系），用于窗口识别与锁边吸附。
+   * 不传或为空时退化成纯手动框选。
+   */
+  windows?: Bounds[];
   [key: string]: unknown;
 }
 
@@ -27,6 +32,7 @@ export default function Screenshots({
   height,
   lang,
   className,
+  windows,
   ...props
 }: ScreenshotsProps): ReactElement {
   const propsRef = useRef(props);
@@ -55,6 +61,7 @@ export default function Screenshots({
     canvasContextRef,
     history,
     bounds,
+    windows: windows ?? [],
     cursor,
     operation,
   };

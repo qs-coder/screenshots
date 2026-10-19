@@ -6,8 +6,10 @@ import {
   useEffect,
   useImperativeHandle,
   useLayoutEffect,
+  useMemo,
   useRef,
 } from "react";
+import getSnapEdges from "../getSnapEdges";
 import useBounds from "../hooks/useBounds";
 import useCursor from "../hooks/useCursor";
 import useEmitter from "../hooks/useEmitter";
@@ -51,7 +53,7 @@ export default memo(
     _props,
     ref
   ): ReactElement | null {
-    const { url, image, width, height } = useStore();
+    const { url, image, width, height, windows } = useStore();
 
     const emitter = useEmitter();
     const [history] = useHistory();
@@ -66,6 +68,11 @@ export default memo(
     const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
 
     const isCanResize = bounds && !history.stack.length && !operation;
+
+    const edges = useMemo(
+      () => getSnapEdges(windows, width, height),
+      [windows, width, height]
+    );
 
     // biome-ignore lint/correctness/useExhaustiveDependencies: draw only cares about bounds, ctxRef and history
     const draw = useCallback(() => {
@@ -143,11 +150,13 @@ export default memo(
             bounds,
             width,
             height,
-            resizeOrMoveRef.current
+            resizeOrMoveRef.current,
+            // Alt/⌥ 是吸附的逃生口，需要精确到像素时按住它
+            e.altKey ? undefined : edges
           )
         );
       },
-      [width, height, bounds, boundsDispatcher]
+      [width, height, bounds, boundsDispatcher, edges]
     );
 
     useLayoutEffect(() => {
