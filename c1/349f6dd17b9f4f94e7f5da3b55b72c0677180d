@@ -1,0 +1,24 @@
+packages/electron-screenshots/README.md
+  h_b66c7b30fc5084 124-150,183-186
+packages/electron-screenshots/package.json
+  h_b66c7b30fc5084 3
+packages/electron-screenshots/src/demo.ts
+  h_b66c7b30fc5084 2,5-56,63,67-87
+packages/electron-screenshots/src/demoPreload.ts
+  h_b66c7b30fc5084 1-7
+packages/electron-screenshots/src/getWindows.ts
+  h_b66c7b30fc5084 1-64
+packages/electron-screenshots/src/index.ts
+  h_b66c7b30fc5084 13-14,19,45-52,57-67,84-97,120,133-173,177-190,192-200,203-221,224-232,234-235,237-238,282-290,315-316,352,354-369,376,426,433-435,437-466,491,493-604,611,613-615,624-625,648-650,652-665,668,676-679,762,826,829-839,846
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c1349f6dd17b9f4f94e7f5da3b55b72c0677180d",
+  "prompts": {},
+  "humans": {
+    "h_b66c7b30fc5084": {
+      "author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  }
+}
