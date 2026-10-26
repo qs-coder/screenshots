@@ -1,0 +1,16 @@
+packages/electron-screenshots/src/demo.ts
+  h_b66c7b30fc5084 63-64
+packages/electron-screenshots/src/index.ts
+  h_b66c7b30fc5084 20,61-63,855-856,858-890
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "735d2199add6e5db7d35c6524b99f3e87a1f29e7",
+  "prompts": {},
+  "humans": {
+    "h_b66c7b30fc5084": {
+      "author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  }
+}
