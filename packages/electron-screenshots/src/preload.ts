@@ -41,6 +41,13 @@ contextBridge.exposeInMainWorld('screenshots', {
 
     ipcRenderer.send('SCREENSHOTS:reset');
   },
+  /**
+   * 请求光标邻域的原生分辨率元素识别，结果从 `on('edges-precise')` 回来。
+   * 只有主进程开了 detectEdges 才有响应。
+   */
+  edgeRegion: (region: Bounds) => {
+    ipcRenderer.send('SCREENSHOTS:edgeRegion', region);
+  },
   save: (arrayBuffer: ArrayBuffer, data: ScreenshotsData) => {
     console.log('contextBridge save', arrayBuffer, data);
 

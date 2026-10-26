@@ -53,7 +53,7 @@ export default memo(
     _props,
     ref
   ): ReactElement | null {
-    const { url, image, width, height, windows } = useStore();
+    const { url, image, width, height, windows, edges } = useStore();
 
     const emitter = useEmitter();
     const [history] = useHistory();
@@ -69,9 +69,10 @@ export default memo(
 
     const isCanResize = bounds && !history.stack.length && !operation;
 
-    const edges = useMemo(
-      () => getSnapEdges(windows, width, height),
-      [windows, width, height]
+    const snapEdges = useMemo(
+      // 拖框只吸附窗口的边（元素边太碎会把选区带偏）；窗口枚举不到时才退回元素边
+      () => getSnapEdges(windows.length ? windows : edges, width, height),
+      [windows, edges, width, height]
     );
 
     // biome-ignore lint/correctness/useExhaustiveDependencies: draw only cares about bounds, ctxRef and history
@@ -152,11 +153,11 @@ export default memo(
             height,
             resizeOrMoveRef.current,
             // Alt/⌥ 是吸附的逃生口，需要精确到像素时按住它
-            e.altKey ? undefined : edges
+            e.altKey ? undefined : snapEdges
           )
         );
       },
-      [width, height, bounds, boundsDispatcher, edges]
+      [width, height, bounds, boundsDispatcher, snapEdges]
     );
 
     useLayoutEffect(() => {

@@ -5,7 +5,7 @@ import './icons/iconfont.less';
 import './screenshots.less';
 import ScreenshotsBackground from './ScreenshotsBackground';
 import ScreenshotsCanvas from './ScreenshotsCanvas';
-import ScreenshotsContext from './ScreenshotsContext';
+import ScreenshotsContext, { EMPTY_BOUNDS } from './ScreenshotsContext';
 import ScreenshotsOperations from './ScreenshotsOperations';
 import type { Bounds, Emitter, History } from './types';
 import useGetLoadedImage from './useGetLoadedImage';
@@ -23,6 +23,12 @@ export interface ScreenshotsProps {
    * 不传或为空时退化成纯手动框选。
    */
   windows?: Bounds[];
+  /**
+   * 从截图像素里识别出的元素矩形（屏幕内坐标系），是 `windows` 的兜底：
+   * 只有光标不在任何系统窗口里时才用它拾取；吸附只认 `windows` 的边，它只在
+   * `windows` 为空时顶上。不传或为空时行为与只有 windows 时完全一致。
+   */
+  edges?: Bounds[];
   [key: string]: unknown;
 }
 
@@ -33,6 +39,7 @@ export default function Screenshots({
   lang,
   className,
   windows,
+  edges,
   ...props
 }: ScreenshotsProps): ReactElement {
   const propsRef = useRef(props);
@@ -61,7 +68,8 @@ export default function Screenshots({
     canvasContextRef,
     history,
     bounds,
-    windows: windows ?? [],
+    windows: windows ?? EMPTY_BOUNDS,
+    edges: edges ?? EMPTY_BOUNDS,
     cursor,
     operation,
   };

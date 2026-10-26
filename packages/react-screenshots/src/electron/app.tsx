@@ -1,5 +1,5 @@
 import type { ReactElement } from 'react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Screenshots from '../Screenshots';
 import type { Bounds } from '../Screenshots/types';
 import type { Lang } from '../Screenshots/zh_CN';
@@ -20,6 +20,9 @@ export default function App(): ReactElement {
   const [display, setDisplay] = useState<Display | undefined>(undefined);
   const [lang, setLang] = useState<Lang | undefined>(undefined);
   const [windows, setWindows] = useState<Bounds[]>([]);
+  const [edges, setEdges] = useState<Bounds[]>([]);
+  // 截图底图的 objectURL，换屏和结束时都要 revoke，否则每张 3MB 的 PNG 一直挂在内存里
+  const objectUrlRef = useRef<string | null>(null);
 
   const onSave = useCallback(
     async (blob: Blob | null, bounds: Bounds) => {
@@ -58,33 +61,60 @@ export default function App(): ReactElement {
       setLang(lang);
     };
 
-    const onCapture = (
-      display: Display,
-      dataURL: string,
-      windowBounds: Bounds[] = [],
-    ) => {
+    // 主进程发来的是 Buffer，过 IPC 到渲染端是 Uint8Array（ArrayBuffer  backing）
+    const onCapture = (display: Display, png: Uint8Array<ArrayBuffer>) => {
       setDisplay(display);
+      // 元素与窗口识别都是异步的，先清掉上一张图的结果，免得矩形贴在新图上
+      setEdges([]);
+      setWindows([]);
+      // 主进程直接给 PNG 字节，不再走 base64 dataURL：省一次编码、一次解码，
+      // 以及一个几 MB 字符串穿过 IPC
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+      }
+      const next = URL.createObjectURL(new Blob([png], { type: 'image/png' }));
+      objectUrlRef.current = next;
+      setUrl(next);
+    };
+
+    const onWindows = (windowBounds: Bounds[] = []) => {
       setWindows(windowBounds);
-      setUrl(dataURL);
+    };
+
+    const onEdges = (edgeBounds: Bounds[] = []) => {
+      setEdges(edgeBounds);
     };
 
     const onReset = () => {
       setUrl(undefined);
       setDisplay(undefined);
       setWindows([]);
+      setEdges([]);
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = null;
+      }
       // 确保截图区域被重置
       requestAnimationFrame(() => window.screenshots.reset());
     };
 
     window.screenshots.on('setLang', onSetLang);
     window.screenshots.on('capture', onCapture);
+    window.screenshots.on('windows', onWindows);
+    window.screenshots.on('edges', onEdges);
     window.screenshots.on('reset', onReset);
     // 告诉主进程页面准备完成
     window.screenshots.ready();
     return () => {
       window.screenshots.off('capture', onCapture);
+      window.screenshots.off('windows', onWindows);
+      window.screenshots.off('edges', onEdges);
       window.screenshots.off('setLang', onSetLang);
       window.screenshots.off('reset', onReset);
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = null;
+      }
     };
   }, []);
 
@@ -107,6 +137,7 @@ export default function App(): ReactElement {
         width={width}
         height={height}
         windows={windows}
+        edges={edges}
         lang={lang}
         onSave={onSave}
         onCancel={onCancel}

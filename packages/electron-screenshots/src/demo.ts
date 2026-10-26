@@ -60,7 +60,8 @@ app.whenReady().then(() => {
       operation_rectangle_title: '矩形2323',
     },
     singleWindow: true,
-    promptScreenPermission: true,
+    promptScreenPermission: false,
+    detectEdges: true,
   });
   screenshots.$view.webContents.openDevTools();
 

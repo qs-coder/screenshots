@@ -13,6 +13,8 @@ interface GlobalScreenshots {
   stop: () => void;
   ready: () => void;
   reset: () => void;
+  /** 请求光标邻域的原生分辨率识别，结果走 `on('edges-precise')`；非 Electron 环境可以没有 */
+  edgeRegion?: (region: Bounds) => void;
   save: (arrayBuffer: ArrayBuffer, data: ScreenshotsData) => void;
   cancel: () => void;
   ok: (arrayBuffer: ArrayBuffer, data: ScreenshotsData) => void;

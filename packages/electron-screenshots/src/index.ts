@@ -1,5 +1,6 @@
 import Events from 'node:events';
 import debug, { type Debugger } from 'debug';
+import type { Image as ShotImage } from 'node-screenshots';
 import {
   BrowserView,
   BrowserWindow,
@@ -16,6 +17,13 @@ import {
 import fs from 'fs-extra';
 import Event from './event.js';
 import getDisplay, { type Display } from './getDisplay.js';
+import getEdges, {
+  getPreciseEdges,
+  type EdgeThresholds,
+  type Pixels,
+  type Region,
+} from './getEdges.js';
+import { isEdgesDebugEnabled, writeEdgesDebugImage } from './edgesDebug.js';
 import getWindows from './getWindows.js';
 import padStart from './padStart.js';
 import type { Bounds, ScreenshotsData } from './preload.js';
@@ -50,6 +58,26 @@ export interface ScreenshotsOpts {
    * 默认 false：库不应该擅自给所有消费者弹窗和拦截图，宿主应用自己决定要不要这套引导。
    */
   promptScreenPermission?: boolean;
+  /**
+   * 元素级自动框选：截图窗口显示之后，在 worker 线程里用截图像素（`edge_det`）
+   * 识别界面里的元素矩形（按钮、卡片、输入框等），作为 hover 拾取的兜底边源。
+   *
+   * 与窗口识别**并存**，拾取顺序由渲染端保证：光标落在某个系统窗口里（含窗口边框那 1px）就整窗选中，
+   * 只有落在窗口之外（桌面控件、Wayland、macOS 未授权）才用元素矩形。
+   * 像素法只能看到"露出来的那部分"，被别的窗口压住的下边界它检不出来，
+   * 所以整窗永远以窗口数据为准；吸附同理只认窗口的边（元素边太碎），`windows` 为空时才由元素边顶上。
+   *
+   * 默认 false：多一个 WASM 依赖，且每次截图在后台多花几十到几百毫秒（不阻塞截图窗口显示）。
+   * 另注意 macOS 未授予屏幕录制权限时，截图像素里根本没有其他应用的内容，
+   * 开了也只能得到壁纸碎块。
+   */
+  detectEdges?: boolean;
+  /**
+   * 元素识别的 Canny 双阈值，默认 `{ low: 20, high: 60 }`。
+   * 浅色低对比的界面（灰底白卡）识别不出来就往下调，壁纸噪声太多就往上调。
+   * 只在 `detectEdges` 开启时生效。
+   */
+  edgeThresholds?: { low?: number; high?: number };
 }
 
 export type { Bounds };
@@ -82,6 +110,28 @@ export default class Screenshots extends Events {
   private singleWindow: boolean;
 
   private isPromptScreenPermission: boolean;
+
+  private isDetectEdges: boolean;
+
+  private edgeThresholds: EdgeThresholds | undefined;
+
+  /**
+   * 每次下发截图都自增。元素检测是异步的，靠它判断结果还对不对应当前这张图。
+   */
+  private captureSeq = 0;
+
+  /**
+   * 当前这张截图的像素缓存，邻域精修要用。
+   *
+   * 精修是渲染端 hover 时按需发起的，同一个 worker 入口要能反复调用，
+   * 所以这里留住像素、endCapture 时释放；不复用 `toPixels` 的返回值是因为它每次拷一份。
+   * 必须连 `display` 一起存：精修要用这份像素所在屏的原点和缩放比，
+   * 而 `getDisplay()` 返回的是**光标当前所在**的屏，跟手换屏时两者会错位。
+   */
+  private edgeSource: { pixels: Pixels; display: Display } | undefined;
+
+  /** 本轮枚举到的系统窗口矩形，只给调试图画框用（识别结果本身走 `SCREENSHOTS:windows`） */
+  private captureWindows: Bounds[] = [];
 
   /**
    * 截图进行中标记。endCapture 里主动 blur 时它已被置 false，
@@ -118,6 +168,8 @@ export default class Screenshots extends Events {
     this.logger = opts?.logger || debug('electron-screenshots');
     this.singleWindow = opts?.singleWindow || false;
     this.isPromptScreenPermission = opts?.promptScreenPermission || false;
+    this.isDetectEdges = opts?.detectEdges || false;
+    this.edgeThresholds = opts?.edgeThresholds;
     this.listenIpc();
     this.$view.webContents.loadURL(
       `file://${require.resolve('@qs-coder/react-screenshots/dist/electron.html')}`,
@@ -199,37 +251,35 @@ export default class Screenshots extends Events {
     }
     mark('promptScreenPermission');
 
-    const [imageUrl] = await Promise.all([this.capture(display), this.isReady]);
-    mark('capture');
+    // 建窗口里的 reset 要等渲染端回执，所以先把渲染端就绪排在最前面（通常应用启动时就已 resolve）
+    await this.isReady;
+    mark('isReady');
 
-    // 窗口识别与锁边的数据源，拿不到就是空数组
-    const windows = await getWindows(display);
-    mark(`windows(${windows.length})`);
-    this.logger('窗口坐标（前两个）%o', windows.slice(0, 2));
-    if (!windows.length) {
-      // 空列表几乎都是权限问题，不说清楚的话排查成本极高
-      // （未授权时截图依然能"出图"，但图里只有壁纸，所以"截图能用"推不出"有权限"）
-      const reason =
-        process.platform === 'darwin'
-          ? `screen access=${systemPreferences.getMediaAccessStatus('screen')}`
-          : process.platform === 'linux'
-            ? 'Linux 仅支持 X11，Wayland 会话下系统不向其他进程暴露窗口几何'
-            : '请检查窗口枚举结果是否被安全软件拦截';
-      this.logger('窗口识别不可用（空列表）%s', reason);
-    }
+    /**
+     * "先锁定屏幕"的关键：截屏+编码 与 建窗口（含 reset 等待）互不依赖，并行做，
+     * 于是第一帧出现的时间约等于 captureImage + toPng，而不是两者相加。
+     */
+    const [shot, $win] = await Promise.all([
+      this.capture(display),
+      this.createWindow(display),
+    ]);
+    mark('capture + createWindow');
 
     this.capturing = true;
 
-    await this.createWindow(display);
-    mark('createWindow');
-
-    this.$view.webContents.send(
-      'SCREENSHOTS:capture',
-      display,
-      imageUrl,
-      windows,
-    );
+    const seq = ++this.captureSeq;
+    this.$view.webContents.send('SCREENSHOTS:capture', display, shot.png);
+    /**
+     * 拿到图才显示，而不是先显示一个空层再等图。
+     * 窗口是透明的，提前 show 只会让这段空档里桌面点不动、焦点还被抢走。
+     */
+    $win.show();
     mark('send capture');
+
+    /**
+     * 两个拾取源都必须排在显示之后，而且要**先窗口后元素**，见 `sendWindowsThenEdges`。
+     */
+    void this.sendWindowsThenEdges(shot, display, seq);
 
     // 屏蔽其他屏幕，截图期间点不到别的地方
     this.syncBlockWindows(display);
@@ -267,7 +317,7 @@ export default class Screenshots extends Events {
         this.screenWatcher.currentDisplay = display;
 
         // 预加载新屏幕的截图
-        const imageUrl = await this.capture(display);
+        const shot = await this.capture(display);
 
         // 更新窗口和视图
         this.$win.setBounds(display);
@@ -278,13 +328,11 @@ export default class Screenshots extends Events {
           height: display.height,
         });
 
-        // 发送新的截图数据
-        this.$view.webContents.send(
-          'SCREENSHOTS:capture',
-          display,
-          imageUrl,
-          await getWindows(display),
-        );
+        // 发送新的截图数据（两个拾取源随后走独立通道，和首次截图一样先锁屏）
+        const seq = ++this.captureSeq;
+        this.$view.webContents.send('SCREENSHOTS:capture', display, shot.png);
+        // 换屏后重新识别，旧的矩形会被 captureSeq 丢掉
+        void this.sendWindowsThenEdges(shot, display, seq);
 
         // 活动屏幕变了，屏蔽窗口跟着换
         this.syncBlockWindows(display);
@@ -313,6 +361,9 @@ export default class Screenshots extends Events {
     // 停止屏幕监听
     this.stopScreenWatcher();
     this.capturing = false;
+    // 22MB 级别的像素缓存，截图结束就放手，别占着宿主的内存
+    this.edgeSource = undefined;
+    this.captureWindows = [];
     this.destroyBlockWindows();
     await this.reset();
 
@@ -372,7 +423,7 @@ export default class Screenshots extends Events {
   /**
    * 初始化窗口
    */
-  private async createWindow(display: Display): Promise<void> {
+  private async createWindow(display: Display): Promise<BrowserWindow> {
     const time = performance.now();
     // 重置截图区域
     await this.reset();
@@ -489,11 +540,11 @@ export default class Screenshots extends Events {
       height: display.height,
     });
     this.assertTopMost(this.$win);
-    this.$win.show();
     this.logger(
       'createWindow 耗时 %dms (含 reset)',
       Math.round(performance.now() - time),
     );
+    return this.$win;
   }
 
   /**
@@ -604,7 +655,9 @@ export default class Screenshots extends Events {
     this.$blockWins.clear();
   }
 
-  private async capture(display: Display): Promise<string> {
+  private async capture(
+    display: Display,
+  ): Promise<{ png: Buffer; image?: ShotImage | undefined }> {
     this.logger('SCREENSHOTS:capture');
 
     try {
@@ -650,19 +703,16 @@ export default class Screenshots extends Events {
 
       const buffer = await image.toPng(true);
       const pngCost = Math.round(performance.now() - time);
-      time = performance.now();
 
-      const dataUrl = `data:image/png;base64,${buffer.toString('base64')}`;
       this.logger(
-        'SCREENSHOTS:capture 耗时 import %dms fromPoint %dms captureImage %dms toPng %dms base64 %dms png %dKB',
+        'SCREENSHOTS:capture 耗时 import %dms fromPoint %dms captureImage %dms toPng %dms png %dKB',
         importCost,
         fromPointCost,
         imageCost,
         pngCost,
-        Math.round(performance.now() - time),
         Math.round(buffer.length / 1024),
       );
-      return dataUrl;
+      return { png: buffer, image };
     } catch (err) {
       this.logger('SCREENSHOTS:capture Monitor capture() error %o', err);
       const time = performance.now();
@@ -737,8 +787,219 @@ export default class Screenshots extends Events {
         throw new Error("Can't find screen source");
       }
 
-      return source.thumbnail.toDataURL();
+      // 兜底路径拿不到 RGBA，元素检测只能跳过
+      return { png: source.thumbnail.toPNG() };
     }
+  }
+
+  /**
+   * 两个拾取源的下发顺序。渲染端把 `windows` 为空理解成"这台机器/这个平台拿不到窗口几何"，
+   * 于是拾取和吸附都改由元素矩形顶上；所以这两条通道**不能并行**，必须等窗口那批先到，
+   * 否则元素矩形抢先到达的那几十毫秒里，光标压在窗口上会被切成一堆碎框
+   * （拖框也会被窗口内部的卡片边吸住）—— 0.7.0 没有这个问题，因为窗口矩形和截图在同一个载荷里。
+   */
+  private async sendWindowsThenEdges(
+    shot: { image?: ShotImage | undefined },
+    display: Display,
+    seq: number,
+  ): Promise<void> {
+    await this.sendWindows(display, seq);
+    if (this.isDetectEdges) {
+      await this.detectEdges(shot, display, seq);
+    }
+  }
+
+  /**
+   * 窗口识别与锁边的数据源。刻意排在截图**显示之后**：`Window.all()` 在窗口多的
+   * 机器上是几十到几百毫秒，卡在前面就是拖慢锁屏，而它只服务 hover 和吸附。
+   */
+  private async sendWindows(display: Display, seq: number): Promise<void> {
+    const startedAt = performance.now();
+    const windows = await getWindows(display, this.logger);
+    this.logger(
+      '窗口识别 %d 条 %dms（截图显示之后）',
+      windows.length,
+      Math.round(performance.now() - startedAt),
+    );
+
+    if (!windows.length) {
+      // 空列表几乎都是权限问题，不说清楚的话排查成本极高
+      // （未授权时截图依然能"出图"，但图里只有壁纸，所以"截图能用"推不出"有权限"）
+      const reason =
+        process.platform === 'darwin'
+          ? `screen access=${systemPreferences.getMediaAccessStatus('screen')}`
+          : process.platform === 'linux'
+            ? 'Linux 仅支持 X11，Wayland 会话下系统不向其他进程暴露窗口几何'
+            : '请检查窗口枚举结果是否被安全软件拦截';
+      this.logger('窗口识别不可用（空列表）%s', reason);
+    }
+
+    // 中途换屏或结束了，这批矩形对应的是另一块屏，发过去会错位
+    if (
+      seq !== this.captureSeq ||
+      !this.capturing ||
+      !this.$win ||
+      this.$win.isDestroyed()
+    ) {
+      return;
+    }
+
+    this.captureWindows = windows;
+    this.$view.webContents.send('SCREENSHOTS:windows', windows);
+  }
+
+  /**
+   * 元素级识别（`edge_det`）。截图窗口显示之后才异步执行，所以不拖慢截图出现的速度；
+   * 整窗拾取由渲染端保证以窗口数据为准，这里只补窗口盖不到的地方。
+   *
+   * 整屏这一遍为了压耗时可能会降采样，边框只当"候选集"用；
+   * 贴得准的矩形由 `SCREENSHOTS:edgeRegion` 的邻域精修按原生分辨率现算。
+   */
+  private async detectEdges(
+    shot: { image?: ShotImage | undefined },
+    display: Display,
+    seq: number,
+  ): Promise<void> {
+    if (!shot.image) {
+      // 兜底的截图路径（desktopCapturer）拿不到 RGBA
+      return;
+    }
+    // 这一遍排在窗口下发之后，那几十到几百毫秒里截图可能已经结束了，
+    // 别为一幅不会再被拾取的图拷 22MB 像素、再跑一遍 WASM
+    if (!this.capturing || seq !== this.captureSeq) {
+      return;
+    }
+
+    const debugOn = isEdgesDebugEnabled();
+    const startedAt = performance.now();
+    // 调试模式要同一份像素再画一次框，别为了省一次拷贝把缓冲搞成两份语义
+    const pixels = this.toPixels(shot.image, display, debugOn);
+    const { bounds, rawBorders } = await getEdges(pixels, display, this.logger, {
+      thresholds: this.edgeThresholds,
+      debug: debugOn,
+    });
+    this.logger(
+      '元素检测 %d 条 %dms',
+      bounds.length,
+      Math.round(performance.now() - startedAt),
+    );
+
+    if (debugOn && rawBorders) {
+      try {
+        this.logger(
+          '元素检测调试图 %s（原生真值 %d 条）',
+          writeEdgesDebugImage({
+            pixels,
+            rawBorders,
+            bounds,
+            windows: this.captureWindows,
+          }),
+          rawBorders.length,
+        );
+      } catch (err) {
+        this.logger('元素检测调试图写入失败 %o', err);
+      }
+    }
+
+    // 中途换屏或结束了，这批矩形对应的是另一张图，发过去会错位
+    if (
+      seq !== this.captureSeq ||
+      !this.capturing ||
+      !this.$win ||
+      this.$win.isDestroyed()
+    ) {
+      return;
+    }
+
+    // 换屏后这张图作废，新的 detectEdges 会重新填
+    this.edgeSource = { pixels, display };
+    this.$view.webContents.send('SCREENSHOTS:edges', bounds);
+  }
+
+  /**
+   * 光标邻域的**原生分辨率**精修：渲染端 hover 到窗口之外的位置时发起，
+   * 结果只回给那一次请求（`SCREENSHOTS:edges-precise`），不进整屏候选集。
+   */
+  private async sendPreciseEdges(rect: Region): Promise<void> {
+    if (!this.capturing || !this.edgeSource) {
+      // 没在截图、或这张图拿不到 RGBA（兜底截图路径）
+      return;
+    }
+    // 像素和屏必须成对取，精修的坐标空间才是这张图所在屏的
+    const { pixels, display } = this.edgeSource;
+    const seq = this.captureSeq;
+    const region = clampRegion(rect, display);
+    if (!region) {
+      return;
+    }
+    // 裁剪区必须装得下整个元素，边才检得出来，所以粗矩形四周再留 8 DIP
+    const crop: Region = {
+      x: region.x - 8,
+      y: region.y - 8,
+      width: region.width + 16,
+      height: region.height + 16,
+    };
+    // 原分辨率下区域越大越慢；粗矩形本身就大（比如整块桌面区域）时这次精修不值得做
+    const maxSide = Math.max(pixels.width, pixels.height) / pixels.scale;
+    if (
+      Math.max(crop.width, crop.height) > Math.min(700, maxSide) ||
+      crop.width * crop.height > maxSide * maxSide * 0.35
+    ) {
+      this.logger('邻域精修跳过（区域过大）%o', crop);
+      return;
+    }
+
+    const startedAt = performance.now();
+    const { bounds } = await getPreciseEdges(
+      pixels,
+      display,
+      this.logger,
+      crop,
+      this.edgeThresholds,
+      region,
+    );
+    this.logger(
+      '邻域精修 %d 条 %dms 粗矩形 %o → %o',
+      bounds.length,
+      Math.round(performance.now() - startedAt),
+      region,
+      bounds[0],
+    );
+
+    if (
+      seq !== this.captureSeq ||
+      !this.capturing ||
+      !this.$win ||
+      !this.$view ||
+      this.$win.isDestroyed() ||
+      this.$view.webContents.isDestroyed()
+    ) {
+      // 等 worker 期间换了屏，这份精修结果对应的是旧图，发过去会贴错地方
+      return;
+    }
+    this.$view.webContents.send('SCREENSHOTS:edges-precise', region, bounds);
+  }
+
+  /**
+   * 截图像素。要趁 Image 还在手上取，晚一步就得重新截屏。
+   * napi 给的 Buffer 可能是外部内存，不能直接交给 worker，所以先拷一份。
+   *
+   * `reuse` 给调试模式用：同一份像素要喂检测和调试图两次，少拷一次是 22MB。
+   */
+  private toPixels(image: ShotImage, display: Display, reuse?: boolean): Pixels {
+    const raw = image.toRawSync();
+    const buf = reuse
+      ? (raw.buffer.slice(
+          raw.byteOffset,
+          raw.byteOffset + raw.byteLength,
+        ) as ArrayBuffer)
+      : new Uint8Array(raw).buffer;
+    return {
+      buf,
+      width: image.width,
+      height: image.height,
+      scale: image.width / display.width,
+    };
   }
 
   /**
@@ -854,5 +1115,28 @@ export default class Screenshots extends Events {
         this.endCapture();
       },
     );
+
+    /**
+     * 光标邻域的原生分辨率精修请求，只有开了 detectEdges 才有意义
+     * （没开时 edgeSource 永远是 undefined，直接忽略）。
+     */
+    ipcMain.on('SCREENSHOTS:edgeRegion', (_event, region: Region) => {
+      if (!this.isDetectEdges || !region) {
+        return;
+      }
+      void this.sendPreciseEdges(region);
+    });
   }
+}
+
+/** 夹到屏幕内并保证最小尺寸，越界越严重就越没意义，直接返回 undefined 省一次 worker */
+function clampRegion(rect: Region, display: Display): Region | undefined {
+  const x = Math.max(0, Math.min(rect.x, display.width - 2));
+  const y = Math.max(0, Math.min(rect.y, display.height - 2));
+  const width = Math.min(display.width - x, Math.max(2, rect.width));
+  const height = Math.min(display.height - y, Math.max(2, rect.height));
+  if (width < 2 || height < 2) {
+    return undefined;
+  }
+  return { x, y, width, height };
 }
