@@ -1,0 +1,18 @@
+packages/electron-screenshots/package.json
+  h_b66c7b30fc5084 3
+packages/react-screenshots/package.json
+  h_b66c7b30fc5084 3
+packages/react-screenshots/src/Screenshots/composeImage.ts
+  h_b66c7b30fc5084 21-29,38-46,49-55,58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3d13a74a55e9eb521dc16c6710efd2c819ea0d8c",
+  "prompts": {},
+  "humans": {
+    "h_b66c7b30fc5084": {
+      "author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  }
+}
