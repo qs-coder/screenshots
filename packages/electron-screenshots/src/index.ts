@@ -1,6 +1,5 @@
 import Events from 'node:events';
 import debug, { type Debugger } from 'debug';
-import type { Image as ShotImage } from 'node-screenshots';
 import {
   BrowserView,
   BrowserWindow,
@@ -15,18 +14,24 @@ import {
   systemPreferences,
 } from 'electron';
 import fs from 'fs-extra';
+import type { Image as ShotImage } from 'node-screenshots';
+import { isEdgesDebugEnabled, writeEdgesDebugImage } from './edgesDebug.js';
 import Event from './event.js';
-import getDisplay, { type Display } from './getDisplay.js';
+import getDisplay, { type Display, toDisplay } from './getDisplay.js';
 import getEdges, {
-  getPreciseEdges,
   type EdgeThresholds,
+  getPreciseEdges,
   type Pixels,
   type Region,
 } from './getEdges.js';
-import { isEdgesDebugEnabled, writeEdgesDebugImage } from './edgesDebug.js';
-import getWindows from './getWindows.js';
+import getWindows, { resetWindowCache } from './getWindows.js';
 import padStart from './padStart.js';
 import type { Bounds, ScreenshotsData } from './preload.js';
+import {
+  bundleIdOf,
+  getScreenAccess,
+  resolveResponsibleApp,
+} from './screenPermission.js';
 
 export type LoggerFn = (...args: unknown[]) => void;
 export type Logger = Debugger | LoggerFn;
@@ -93,6 +98,9 @@ const windowTypes: Record<string, string | undefined> = {
 // 屏蔽窗口只需要一个 not-allowed 光标，画面本体由窗口的半透明黑底提供
 const BLOCK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>html,body{position:fixed;top:0;right:0;bottom:0;left:0;margin:0;overflow:hidden;cursor:not-allowed}</style></head><body></body></html>`;
 
+/** 屏蔽窗口压暗到多黑。注意它是**会被截进图里**的，所以截图必须发生在它出现之前 */
+const BLOCK_OPACITY = 0.5;
+
 export default class Screenshots extends Events {
   // 截图窗口对象
   public $win: BrowserWindow | null = null;
@@ -134,6 +142,26 @@ export default class Screenshots extends Events {
   private captureWindows: Bounds[] = [];
 
   /**
+   * 每块屏幕的截图，key 为 display.id。
+   *
+   * 换屏时**绝不能重新截屏**：那一刻目标屏上盖着屏蔽窗口，重截会把那层半透明黑一起拍进去，
+   * 于是换过去的底图整体暗一半 —— 用户看到的就是"框选区域不变亮"、导出的图也是灰的。
+   * 所以其他屏幕在屏蔽窗口出现之前就截好放在这里，换屏只是取缓存。
+   */
+  private shots = new Map<
+    number,
+    { display: Display; png: Buffer; image?: ShotImage | undefined }
+  >();
+
+  /**
+   * 渲染端回执「新一帧已经画出来了」。
+   *
+   * 换屏时窗口是搬到另一块屏上的，搬之前必须先让渲染端把新图这一帧画完：
+   * 否则窗口落地的那几百毫秒里显示的是空/旧内容，在透明窗口下就是一次闪烁。
+   */
+  private paintWaiter: { resolve: () => void } | null = null;
+
+  /**
    * 截图进行中标记。endCapture 里主动 blur 时它已被置 false，
    * 避免 blur 监听器又把焦点抢回来。
    */
@@ -157,11 +185,18 @@ export default class Screenshots extends Events {
     currentDisplay: Display;
     timer: any;
     watching: boolean;
+    /**
+     * checkScreen 互斥锁：capture 是几百毫秒的异步操作，而定时器 100ms 一次，
+     * 不加锁会并发启动多个 capture，每个完成时都 ++captureSeq，导致先完成的
+     * sendWindows/detectEdges 里 seq !== captureSeq 被丢掉，渲染端拿不到 windows/edges。
+     */
+    lock: boolean;
   } = {
-      currentDisplay: null as unknown as Display,
-      timer: null,
-      watching: false,
-    };
+    currentDisplay: null as unknown as Display,
+    timer: null,
+    watching: false,
+    lock: false,
+  };
 
   constructor(opts?: ScreenshotsOpts) {
     super();
@@ -180,8 +215,45 @@ export default class Screenshots extends Events {
   }
 
   /**
-   * 开始截图
+   * 真抓一次屏幕源 —— 这是唯一可信的"有权限"证据。
+   *
+   * `systemPreferences.getMediaAccessStatus('screen')` 不可靠：macOS 上它会返回
+   * `not-determined` / `unknown`（首次调用、刚授权、被 launchd 拉起时都可能），
+   * 拿它当"没权限"用，用户明明早就授权了也会每次被弹窗拦住。
+   *
+   * 反过来，"拿不到"也**不能**推断没授权（采集环境异常时同样返回空），
+   * 所以调用方只把它当**正向证据**：能拿到就一定是有权限。
+   *
+   * 这一调同时就是 TCC 的按需登记：不真的调采集 API，应用不会出现在
+   * 「屏幕与系统音频录制」列表里，用户去系统设置根本找不到可勾的项。
+   * 系统框没被回答时 Promise 可能一直不返回，所以加超时兜底。
    */
+  private async canCaptureScreen(timeout = 20_000): Promise<boolean> {
+    try {
+      const sources = await Promise.race([
+        desktopCapturer.getSources({
+          types: ['screen'],
+          thumbnailSize: { width: 1, height: 1 },
+        }),
+        new Promise<null>((resolve) => {
+          setTimeout(() => resolve(null), timeout);
+        }),
+      ]);
+      return Array.isArray(sources) && sources.length > 0;
+    } catch {
+      // 拿不到源不打断主流程，交给后面的引导弹窗
+      return false;
+    }
+  }
+
+  /**
+   * 本会话是否**已确认**有屏幕录制权限。
+   *
+   * 只记「有」，不记「没有」：一次误判被永久缓存的话，用户会在明明有权限的
+   * 情况下被反复弹窗 —— 这正是"授权了还一直弹"的根因。
+   */
+  private screenGranted = false;
+
   /**
    * macOS 的屏幕录制权限无法由程序申请（`systemPreferences.askForMediaAccess`
    * 只接受 microphone/camera），只能把人引导到系统设置里，所以这里只提示。
@@ -189,35 +261,84 @@ export default class Screenshots extends Events {
    * 必须在截图窗口创建之前弹：截图窗口有失焦即抢回焦点的逻辑，
    * 应用级模态框会被它压下去，用户根本点不到。
    *
-   * 未授权期间每次触发截图都会提示并中止，直到用户完成授权——
-   * 否则按钮看起来像没反应，比反复一个弹窗更难排查。
+   * 判定顺序刻意是「先真抓一次、再信状态」：`getMediaAccessStatus` 会给出
+   * `not-determined` / `unknown` 这类"没准话"的答案，信它就会在明明有权限时
+   * 反复弹窗。只有**真的抓不到画面**才走引导。
    *
-   * @returns true 表示尚未授权（已弹出引导），本次截图应该中止
+   * @returns true 表示确实拿不到画面（已弹出引导），本次截图应该中止
    */
   private async promptScreenPermission(): Promise<boolean> {
     if (!this.isPromptScreenPermission || process.platform !== 'darwin') {
       return false;
     }
 
-    const status = systemPreferences.getMediaAccessStatus('screen');
-    if (status === 'granted') {
+    // 已经确认过有权限：之后一次都不再打扰
+    if (this.screenGranted) {
       return false;
     }
-    this.logger('屏幕录制权限 %s，窗口识别与锁边不可用', status);
+
+    // 1) 系统明确说 granted，直接放行
+    if (getScreenAccess() === 'granted') {
+      this.screenGranted = true;
+      return false;
+    }
+
+    /**
+     * 2) 系统没给准话（not-determined / unknown / denied），用"能不能真抓到画面"来定。
+     *
+     * 这一调同时会触发 macOS 的授权框：用户点「允许」后 sources 就非空，
+     * 于是直接放行、继续截图 —— 不再弹"需要重启"的二次弹窗。
+     */
+    if (await this.canCaptureScreen()) {
+      this.logger(
+        '屏幕录制权限状态为 %s，但能取到屏幕源，按已授权处理',
+        getScreenAccess(),
+      );
+      this.screenGranted = true;
+      return false;
+    }
+
+    /**
+     * 关键：权限记在 TCC 认定的"责任进程"名下，不是记在 Electron 名下。
+     * 从终端 `npm run start` 起的话，要勾的是终端 / IDE；
+     * 从独立的 .app 起的话，要勾的是那个 .app。不把这件事说清楚，
+     * 用户在系统设置里勾了 "Electron" 也还是 denied —— 实测就是这么卡住的。
+     */
+    const target = resolveResponsibleApp();
+    this.logger(
+      '屏幕录制权限 %s，窗口识别与锁边不可用（需授权：%s）',
+      getScreenAccess(),
+      target ? `${target.name} ${target.bundlePath}` : '未识别',
+    );
+
+    const detail = [
+      `要在「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」里勾选 ${
+        target ? `「${target.name}」` : '本应用'
+      }，勾完按 ⌘Q 完全退出再重新打开。`,
+      target
+        ? `要勾的就是这个包：${target.bundlePath}`
+        : '列表里找不到的话，点下面的「复制重置命令」执行一次，再截一次图会重新弹窗。',
+      '注意：macOS 把权限记在"启动它的那个应用"名下 —— 从终端 / IDE 里 npm run start，要勾的是终端或 IDE，不是 Electron。',
+    ].join('\n\n');
 
     const { response } = await dialog.showMessageBox({
       type: 'info',
       title: '开启窗口识别',
       message: '窗口的屏幕录制权限还没授予，本次截图已取消。',
-      detail: `${status === 'denied' ? '权限此前已被拒绝，' : ''}请在「系统设置 → 隐私与安全性 → 屏幕录制」中勾选本应用，授权后重启应用，再截一次图就会有窗口识别与自动锁边。`,
-      buttons: ['打开系统设置', '知道了'],
+      detail,
+      buttons: ['打开系统设置', '复制重置命令', '知道了'],
       defaultId: 0,
-      cancelId: 1,
+      cancelId: 2,
       noLink: true,
     });
     if (response === 0) {
       await shell.openExternal(
         'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+      );
+    } else if (response === 1 && target) {
+      // 之前点过"不允许"的话系统不会再弹窗，只能重置 TCC 记录
+      clipboard.writeText(
+        `tccutil reset ScreenCapture ${bundleIdOf(target.bundlePath) ?? target.name}`,
       );
     }
     return true;
@@ -268,25 +389,205 @@ export default class Screenshots extends Events {
     this.capturing = true;
 
     const seq = ++this.captureSeq;
-    this.$view.webContents.send('SCREENSHOTS:capture', display, shot.png);
+    // 新一轮截图，上一轮的窗口几何和渲染端缓存作废
+    resetWindowCache();
+    this.windowsByDisplay.clear();
+    this.decodedInRenderer.clear();
+    this.shots.set(display.id, {
+      display,
+      png: shot.png,
+      image: shot.image,
+    });
+
     /**
-     * 拿到图才显示，而不是先显示一个空层再等图。
-     * 窗口是透明的，提前 show 只会让这段空档里桌面点不动、焦点还被抢走。
+     * 屏蔽窗口先立起来（全透明，照样挡点击，但不会被拍进图里）。
+     *
+     * 必须排在截图窗口 show 之前：遮罩要"跟着截图一起出来"。
+     * 等绘制完再建就晚了几百毫秒，用户看到的是另一块屏先敞着、过一会儿才压暗。
      */
+    this.ensureBlockWindows();
+
+    /**
+     * 先以**全透明**显示，等渲染端把这一帧画完再亮出来。
+     *
+     * 不能"等画完再 show"：隐藏窗口里 rAF 不跑、解码也慢得离谱（实测首次解码要 1 秒以上，
+     * 而且经常等不到），主进程只能等到超时，截图窗口反而更晚出现。
+     * 也不能"先 show 再等图"：窗口先出现但里面什么都没有，透明窗口直接把桌面透出来，
+     * 等图到了再"啪"地换上去 —— 开局这一下闪烁就是这么来的。
+     * 所以取中间：显示（这样渲染进程才会正常出帧）但完全透明（用户看不见），
+     * 画好了再亮出来，用户看到的第一帧就是完整的截图。
+     */
+    $win.setOpacity(0);
     $win.show();
+    mark('show');
+    // 从这一刻起守住最上层：别的应用随时可能把自己的浮层提到前面
+    this.startTopMostGuard();
+
+    /**
+     * 其他屏幕的预截和这一帧的绘制**并行**跑：截完一块就把那块压暗，
+     * 不用等最慢的那块屏编码完。
+     */
+    void this.captureOtherDisplays(display);
+
+    try {
+      await this.prepareRenderer(display, shot.png);
+    } finally {
+      // 渲染端出问题也必须亮出来，否则用户面对的是一个看不见又点不掉的窗口
+      if (this.$win && !this.$win.isDestroyed()) {
+        this.$win.setOpacity(1);
+      }
+    }
     mark('send capture');
 
     /**
-     * 两个拾取源都必须排在显示之后，而且要**先窗口后元素**，见 `sendWindowsThenEdges`。
+     * 两个拾取源都必须排在显示之后，而且要**先窗口后元素**。
+     * 一次截图里所有屏幕的识别结果都在这里一次算完，之后换屏只下发缓存。
      */
-    void this.sendWindowsThenEdges(shot, display, seq);
-
-    // 屏蔽其他屏幕，截图期间点不到别的地方
-    this.syncBlockWindows(display);
+    void this.startRecognition(shot, display, seq);
 
     // 跟手换屏（与微信、Snipaste 一致），否则扩展屏永远切不过去。
     // 按下鼠标时渲染端会发 SCREENSHOTS:start 停掉监听，此时其他屏幕就被屏蔽窗口锁住。
     this.startScreenWatcher(display);
+  }
+
+  /**
+   * 预截其他屏幕。
+   *
+   * 并行截、并行编码，耗时约等于最慢的那一块屏，不阻塞截图窗口显示。
+   * **每块屏的像素一抓到手就立刻压暗自己的遮罩**（不等 PNG 编码）——
+   * 编码一块 5K 屏要几百毫秒，等编码完再压暗，几块屏会一块一块地黑下去，
+   * 用户看到的就是"遮罩没同步出来"。
+   * 失败只丢这一块屏的缓存（换屏时再补截），不能让整次截图失败。
+   */
+  private async captureOtherDisplays(active: Display): Promise<void> {
+    const others = screen
+      .getAllDisplays()
+      .filter((display) => display.id !== active.id);
+
+    try {
+      await Promise.all(
+        others.map(async (item) => {
+          const display = toDisplay(item);
+          try {
+            /**
+             * 抓完像素就压暗（不等编码），这块屏的遮罩几乎是立刻出来的。
+             * 遮罩必须赶在编码之前：编码一块 5K 屏要几百毫秒，
+             * 等编码完再压暗，几块屏就会一块一块地黑下去，看着像"遮罩没同步"。
+             */
+            const shot = await this.capture(display, () => {
+              if (this.capturing) {
+                this.setBlockDim(display.id, true);
+              }
+            });
+            // 期间截图可能已经结束，缓存留着没用还占内存
+            if (!this.capturing) {
+              return;
+            }
+            this.shots.set(display.id, {
+              display,
+              png: shot.png,
+              image: shot.image,
+            });
+            this.logger(
+              '预截屏幕 %d 完成 %dKB',
+              display.id,
+              shot.png.length >> 10,
+            );
+          } catch (err) {
+            this.logger('预截屏幕 %d 失败 %o', display.id, err);
+          }
+        }),
+      );
+    } finally {
+      // 不管截成没截成，遮罩都得亮起来，否则其他屏幕一直不压暗
+      this.revealBlockWindows(active);
+    }
+  }
+
+  /**
+   * 取某块屏幕的截图：优先用预截缓存，没有才现场截。
+   *
+   * 现场截之前必须先把这块屏的屏蔽窗口隐掉，不然拍到的就是那层半透明黑。
+   * 只有"截图过程中新插进来的屏幕"会走到这条路径。
+   */
+  private async shotOf(
+    display: Display,
+  ): Promise<{ png: Buffer; image?: ShotImage | undefined }> {
+    const cached = this.shots.get(display.id);
+    if (cached) {
+      return cached;
+    }
+
+    const $block = this.$blockWins.get(display.id);
+    const needHide = !!$block && !$block.isDestroyed();
+    // 还原成"截之前什么样"：可能是压暗的，也可能是活动屏的全透明
+    const prevOpacity = needHide ? $block.getOpacity() : 0;
+    if (needHide) {
+      $block.setOpacity(0);
+    }
+    try {
+      const shot = await this.capture(display);
+      this.shots.set(display.id, {
+        display,
+        png: shot.png,
+        image: shot.image,
+      });
+      return shot;
+    } finally {
+      if (needHide && !$block.isDestroyed()) {
+        $block.setOpacity(prevOpacity);
+      }
+    }
+  }
+
+  /**
+   * 把新截图交给渲染端并等它画完这一帧。
+   *
+   * 超时兜底：渲染端可能已经卡死/销毁，不能因为等一个回执把整个截图卡在这里。
+   */
+  private async prepareRenderer(display: Display, png: Buffer): Promise<void> {
+    if (this.$view.webContents.isDestroyed()) {
+      return;
+    }
+
+    const startedAt = performance.now();
+    const painted = this.waitForPaint();
+    // 渲染端已经解过这块屏的图：不用再传一遍几 MB 的 PNG
+    const preloaded = this.decodedInRenderer.has(display.id);
+    this.$view.webContents.send(
+      'SCREENSHOTS:capture',
+      display,
+      preloaded ? undefined : png,
+    );
+    await painted;
+    this.logger(
+      '等待渲染端绘制 %dms%s',
+      Math.round(performance.now() - startedAt),
+      preloaded ? '（预载命中）' : '',
+    );
+  }
+
+  /**
+   * 等渲染端把这一帧画出来。
+   *
+   * 超时只是兜底（渲染端可能已经卡死），不能设太短：渲染进程**第一次**解码一张全屏 PNG
+   * 要一秒左右（之后的每次只要几十毫秒），超时提前放行就会在窗口里露出空白帧 —— 正是要修的那个闪烁。
+   * 实测：首张解码约 1.1s，后续 60~90ms。
+   */
+  private waitForPaint(timeout = 2500): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        this.paintWaiter = null;
+        resolve();
+      }, timeout);
+      this.paintWaiter = {
+        resolve: () => {
+          clearTimeout(timer);
+          this.paintWaiter = null;
+          resolve();
+        },
+      };
+    });
   }
 
   private startScreenWatcher(initialDisplay: Display) {
@@ -296,8 +597,18 @@ export default class Screenshots extends Events {
     this.screenWatcher.watching = true;
 
     const checkScreen = async () => {
-      if (!this.screenWatcher.watching || !this.$win || this.$win.isDestroyed()) {
+      if (
+        !this.screenWatcher.watching ||
+        !this.$win ||
+        this.$win.isDestroyed()
+      ) {
         this.stopScreenWatcher();
+        return;
+      }
+
+      // 前一轮 capture + 下发还没结束，这次直接跳过，避免并发 capture 把 captureSeq 顶掉
+      if (this.screenWatcher.lock) {
+        this.screenWatcher.timer = setTimeout(checkScreen, 100);
         return;
       }
 
@@ -305,37 +616,19 @@ export default class Screenshots extends Events {
       const newDisplay = screen.getDisplayNearestPoint(point);
 
       if (newDisplay.id !== this.screenWatcher.currentDisplay.id) {
-        const display: Display = {
-          id: newDisplay.id,
-          x: Math.floor(newDisplay.bounds.x),
-          y: Math.floor(newDisplay.bounds.y),
-          width: Math.floor(newDisplay.bounds.width),
-          height: Math.floor(newDisplay.bounds.height),
-          scaleFactor: newDisplay.scaleFactor,
-        };
-
-        this.screenWatcher.currentDisplay = display;
-
-        // 预加载新屏幕的截图
-        const shot = await this.capture(display);
-
-        // 更新窗口和视图
-        this.$win.setBounds(display);
-        this.$view.setBounds({
-          x: 0,
-          y: 0,
-          width: display.width,
-          height: display.height,
-        });
-
-        // 发送新的截图数据（两个拾取源随后走独立通道，和首次截图一样先锁屏）
-        const seq = ++this.captureSeq;
-        this.$view.webContents.send('SCREENSHOTS:capture', display, shot.png);
-        // 换屏后重新识别，旧的矩形会被 captureSeq 丢掉
-        void this.sendWindowsThenEdges(shot, display, seq);
-
-        // 活动屏幕变了，屏蔽窗口跟着换
-        this.syncBlockWindows(display);
+        this.screenWatcher.lock = true;
+        const previous = this.screenWatcher.currentDisplay;
+        try {
+          const display = toDisplay(newDisplay);
+          this.screenWatcher.currentDisplay = display;
+          await this.switchDisplay(display, previous);
+        } catch (err) {
+          // 换屏失败（截不到图）就退回上一块屏，下一轮继续重试，别把状态停在半路
+          this.screenWatcher.currentDisplay = previous;
+          this.logger('换屏失败 %o', err);
+        } finally {
+          this.screenWatcher.lock = false;
+        }
       }
 
       // 使用 requestAnimationFrame 的思想控制检查频率
@@ -345,12 +638,78 @@ export default class Screenshots extends Events {
     checkScreen();
   }
 
+  /**
+   * 光标换到另一块屏。
+   *
+   * 顺序是这次修复的核心，目标是**每一步都发生在"用户看不见"的时候**：
+   *
+   * 1. 新图先画好 —— 此刻窗口还在旧屏，替换过程被旧屏挡着；
+   * 2. **旧屏先压暗** —— 此刻旧屏还被截图窗口盖着，这一步也看不见。
+   *    等窗口搬走时，露出来的是"已经变暗的桌面"，而不是真实桌面过一会儿再补一层黑；
+   * 3. 搬窗口 —— 新屏的遮罩还亮着，但它在截图窗口**下面**，所以看不到；
+   * 4. **新屏再撤遮罩** —— 窗口已经盖满了，这一步同样看不见。
+   *
+   * 反过来的顺序（先搬窗口再压暗旧屏）就会露出真实桌面，这就是来回换屏的闪烁来源。
+   *
+   * 截图一律取 `shotOf` 的缓存：目标屏此刻盖着屏蔽窗口，重新截屏会把那层半透明黑拍进去。
+   */
+  private async switchDisplay(
+    display: Display,
+    previous: Display,
+  ): Promise<void> {
+    const $win = this.$win;
+    if (!this.capturing || !$win || $win.isDestroyed()) {
+      return;
+    }
+
+    const startedAt = performance.now();
+    // 中途插拔屏幕时补齐屏蔽窗口（正常情况下这里什么都不做）
+    this.ensureBlockWindows();
+    const shot = await this.shotOf(display);
+    const seq = ++this.captureSeq;
+
+    // 1. 渲染端换图并画好这一帧（此时窗口还在旧屏上，用户看不到这次替换）
+    await this.prepareRenderer(display, shot.png);
+
+    // 2. 旧屏先压暗（被截图窗口盖着，看不见）
+    this.setBlockDim(previous.id, true);
+
+    // 3. 内容已经就绪，窗口搬过去的第一帧就是新屏的画面
+    if (!$win.isDestroyed()) {
+      $win.setBounds(display);
+      this.$view.setBounds({
+        x: 0,
+        y: 0,
+        width: display.width,
+        height: display.height,
+      });
+      this.assertTopMost($win);
+      $win.moveTop();
+    }
+
+    // 4. 新屏撤遮罩（已经被截图窗口盖满，看不见）
+    this.setBlockDim(display.id, false);
+
+    this.logger(
+      '换屏 → %d %dx%d 耗时 %dms',
+      display.id,
+      display.width,
+      display.height,
+      Math.round(performance.now() - startedAt),
+    );
+
+    // 换屏后只下发开场就算好的结果，1ms 量级；这里绝不能再跑识别
+    this.sendRecognition(display, seq);
+  }
+
   private stopScreenWatcher() {
     if (this.screenWatcher.timer) {
       clearTimeout(this.screenWatcher.timer);
       this.screenWatcher.timer = null;
     }
     this.screenWatcher.watching = false;
+    // 结束截图时强制释放锁：万一 capture 还在跑，下一次截图不能被上一轮卡住
+    this.screenWatcher.lock = false;
   }
 
   /**
@@ -358,12 +717,21 @@ export default class Screenshots extends Events {
    */
   public async endCapture(): Promise<void> {
     this.logger('endCapture');
+    // 先停置顶守卫，否则它会一边拆窗口一边把窗口重新抬起来
+    this.stopTopMostGuard();
     // 停止屏幕监听
     this.stopScreenWatcher();
     this.capturing = false;
     // 22MB 级别的像素缓存，截图结束就放手，别占着宿主的内存
     this.edgeSource = undefined;
     this.captureWindows = [];
+    // 每块屏的截图（含原生像素）也一起放掉
+    this.shots.clear();
+    this.windowsByDisplay.clear();
+    this.edgesByDisplay.clear();
+    this.edgePixels.clear();
+    this.decodedInRenderer.clear();
+    this.paintWaiter = null;
     this.destroyBlockWindows();
     await this.reset();
 
@@ -487,34 +855,34 @@ export default class Screenshots extends Events {
       });
 
       /**
-       * Windows 任务栏本身是 topmost 窗口，level 低于 pop-up-menu 的窗口会被它盖住；
-       * 加上 skipTaskbar 之后截图窗口沉底就没有任何入口点回来了，看起来像"截图丢了"。
-       * 所以截图进行中一旦失焦/被最小化，立刻重新置顶并抢回焦点。
+       * 截图窗口被别的窗口抢了层级/焦点时，**立刻**抬回来，不等置顶守卫那一拍。
+       *
+       * Windows 上任务栏本身是 topmost，加上 skipTaskbar 之后窗口沉底就没有任何入口
+       * 点回来了；macOS 上各种浮层（录屏指示器、输入法候选框）也会盖住截图窗口。
+       * 两种情况用户看到的都是"截图跑到别人窗口底下"，所以不区分平台，统一抢回。
        */
-      if (process.platform === 'win32') {
-        this.$win.on('blur', () => {
-          const $win = this.$win;
-          if (
-            !this.capturing ||
-            this.isDialogOpen ||
-            !$win ||
-            $win.isDestroyed() ||
-            !$win.isVisible() ||
-            $win.isFocused()
-          ) {
-            return;
-          }
-          this.logger('SCREENSHOTS:blur, 重新置顶并抢回焦点');
-          this.assertTopMost($win);
-          $win.focus();
-        });
+      this.$win.on('blur', () => {
+        const $win = this.$win;
+        if (
+          !this.capturing ||
+          this.isDialogOpen ||
+          !$win ||
+          $win.isDestroyed() ||
+          !$win.isVisible() ||
+          $win.isFocused()
+        ) {
+          return;
+        }
+        this.logger('SCREENSHOTS:blur, 重新置顶并抢回焦点');
+        this.raiseAll();
+        $win.focus();
+      });
 
-        this.$win.on('minimize', () => {
-          if (this.capturing && !this.isDialogOpen) {
-            this.$win?.restore();
-          }
-        });
-      }
+      this.$win.on('minimize', () => {
+        if (this.capturing && !this.isDialogOpen) {
+          this.$win?.restore();
+        }
+      });
     }
 
     this.$win.setBrowserView(this.$view);
@@ -550,47 +918,92 @@ export default class Screenshots extends Events {
   /**
    * 断言窗口在最上层。
    *
-   * Windows 上 level 从 floating 到 status 的窗口都排在任务栏之下，只有 pop-up-menu
-   * 及以上才在任务栏之上，所以这里用 screen-saver 层级压住任务栏。
+   * 默认层级（floating）**压不住**很多应用：视频播放器、录屏/截图工具、各种 HUD
+   * 都在更高的层级上，于是截图窗口会"跑到别的窗口底下"—— 用户看到的是一半截图、
+   * 一半别人的界面，还以为截图坏了。
+   *
+   * `screen-saver` 是 Electron 能给的最高层级：
+   * - Windows 上从 floating 到 status 都排在任务栏之下，只有 pop-up-menu 及以上才在任务栏之上；
+   * - macOS 上对应 NSScreenSaverWindowLevel，能压住绝大多数常驻浮层。
+   *
+   * `moveTop()` 负责同层级内的相对顺序（同层级时它才是决定谁在上面的那个）。
    * https://www.electronjs.org/docs/latest/api/browser-window#winsetalwaysontopflag-level-relativellevel
    */
   private assertTopMost($win: BrowserWindow | null): void {
     if (!$win || $win.isDestroyed()) {
       return;
     }
-    if (process.platform === 'win32') {
-      $win.setAlwaysOnTop(true, 'screen-saver');
-      $win.moveTop();
-      return;
-    }
-    $win.setAlwaysOnTop(true);
+    $win.setAlwaysOnTop(true, 'screen-saver');
+    $win.moveTop();
   }
 
   /**
-   * 在非活动屏幕上创建/移除屏蔽窗口。
+   * 把截图窗口和所有遮罩一起抬回最上层，**截图窗口必须在最后**。
    *
-   * 截图期间鼠标还能划到别的显示器去点其他程序，这里用一层半透明黑底 + not-allowed
-   * 光标把那些屏幕盖住，让点击全部落在自己窗口上。
-   * Wayland 下无法定位窗口，Linux 统一跳过。
+   * 顺序不能反：遮罩和截图窗口同在 `screen-saver` 层级，谁后抬谁在上面。
+   * 遮罩一旦压住活动屏的截图窗口，macOS 会把截图窗口判成 occluded，
+   * 渲染端被节流（rAF 停、定时器拖到 1s），换屏就开始"追不上光标"。
    */
-  private syncBlockWindows(activeDisplay: Display): void {
+  private raiseAll(): void {
+    for (const $block of this.$blockWins.values()) {
+      if (!$block.isDestroyed()) {
+        $block.setAlwaysOnTop(true, 'screen-saver');
+      }
+    }
+    this.assertTopMost(this.$win);
+  }
+
+  /**
+   * 截图期间的置顶守卫。
+   *
+   * 别的应用可能随时把自己的浮层提到最前（提示气泡、录屏指示器、输入法候选框），
+   * 一次 `assertTopMost` 压不住整个截图过程。这里每隔一段时间重新断言一次，
+   * 用户不小心点到别的地方、或者别的应用抢了层级，几百毫秒内就会自动回到最上面。
+   */
+  private startTopMostGuard(): void {
+    if (this.topMostTimer) {
+      return;
+    }
+    this.topMostTimer = setInterval(() => {
+      // 弹窗期间必须放手：保存对话框就挂在截图窗口上，压在最上面会把对话框盖住
+      if (!this.capturing || this.isDialogOpen) {
+        return;
+      }
+      this.raiseAll();
+    }, 400);
+  }
+
+  private stopTopMostGuard(): void {
+    if (this.topMostTimer) {
+      clearInterval(this.topMostTimer);
+      this.topMostTimer = null;
+    }
+  }
+
+  /**
+   * 为**每一块**屏幕建一个常驻的屏蔽窗口（先全透明）。
+   *
+   * 早先是"活动屏不留、其余屏建"，于是每换一次屏都要销毁一个、重建一个 ——
+   * 重建要走 `new BrowserWindow` + `loadURL` + `show`，实测 80~150ms。
+   * 这段空窗期里刚离开的那块屏会露出**真实桌面**，然后才被半透明黑盖上：
+   * 来回切换就是"亮一下、黑一下"的闪烁，看起来像遮罩在闪。
+   *
+   * 现在一次建全，整场只切 opacity —— 换屏不再创建/销毁任何窗口，没有空窗期。
+   */
+  private ensureBlockWindows(): void {
     if (process.platform === 'linux') {
       return;
     }
 
-    for (const [id, $win] of this.$blockWins) {
-      if (id === activeDisplay.id || $win.isDestroyed()) {
-        this.$blockWins.delete(id);
-        if (!$win.isDestroyed()) {
-          $win.destroy();
-        }
-      }
-    }
+    const alive = new Set<number>();
+    let created = false;
 
     for (const display of screen.getAllDisplays()) {
-      if (display.id === activeDisplay.id || this.$blockWins.has(display.id)) {
+      alive.add(display.id);
+      if (this.$blockWins.has(display.id)) {
         continue;
       }
+      created = true;
 
       const $win = new BrowserWindow({
         title: 'screenshots-blocker',
@@ -617,7 +1030,8 @@ export default class Screenshots extends Events {
         fullscreen: false,
         fullscreenable: false,
         backgroundColor: '#000000',
-        opacity: 0.5,
+        // 建出来一律全透明：预截其他屏幕时不能被拍进去
+        opacity: 0,
         hasShadow: false,
       });
 
@@ -626,6 +1040,10 @@ export default class Screenshots extends Events {
         this.$blockWins.delete(display.id);
       });
 
+      // 遮罩也要压在最上面：默认 floating 层级压不住那些常驻浮层，
+      // 一旦被别的窗口盖住，用户就能点到底下的应用
+      $win.setAlwaysOnTop(true, 'screen-saver');
+
       // 屏蔽窗口必须可聚焦光标才会更新，所以它一拿到焦点就立刻还给截图窗口
       $win.on('focus', () => {
         if (this.capturing) {
@@ -633,16 +1051,74 @@ export default class Screenshots extends Events {
         }
       });
 
-      $win.webContents.on('did-finish-load', () => {
-        if (!$win.isDestroyed()) {
-          this.assertTopMost($win);
-          $win.show();
-          this.logger('SCREENSHOTS:block show display %d', display.id);
-        }
-      });
       $win.loadURL(
         `data:text/html;charset=utf-8,${encodeURIComponent(BLOCK_HTML)}`,
       );
+      // 立刻显示：opacity 是 0，用户看不见，但点击已经挡住了、压暗也是瞬间生效，
+      // 不用等页面加载完（那又是几十毫秒）
+      $win.show();
+
+      $win.webContents.on('did-finish-load', () => {
+        if ($win.isDestroyed()) {
+          return;
+        }
+        this.assertTopMost($win);
+        /**
+         * show() 会把屏蔽窗口抬到最上面，连**同一块屏**上的截图窗口一起压住。
+         *
+         * 后果不只是层级不对：macOS 会把被完全遮住的窗口判成 occluded，
+         * Chromium 于是把渲染端当后台页面节流 —— `document.visibilityState` 变成 hidden，
+         * rAF 不跑、定时器拖到 1s，换屏时的绘制回执就迟迟不到，
+         * 表现就是"窗口追不上光标、来回划屏一路闪"。
+         *
+         * 所以 show 完必须把截图窗口重新抬回去。
+         */
+        if (this.$win && !this.$win.isDestroyed()) {
+          this.assertTopMost(this.$win);
+          this.$win.moveTop();
+        }
+      });
+    }
+
+    // 拔掉的屏幕：销毁它那块，别留着挡一块不存在的区域
+    for (const [id, $win] of this.$blockWins) {
+      if (!alive.has(id)) {
+        this.$blockWins.delete(id);
+        if (!$win.isDestroyed()) {
+          $win.destroy();
+        }
+      }
+    }
+
+    /**
+     * 屏蔽窗口是后建的，会压在截图窗口之上。截图窗口必须重新抬到最上面，
+     * 否则换屏时"先压暗旧屏"那一步会真的把旧屏画面压暗一瞬间才搬走。
+     */
+    if (created && this.$win && !this.$win.isDestroyed()) {
+      this.assertTopMost(this.$win);
+      this.$win.moveTop();
+    }
+  }
+
+  /**
+   * 压暗 / 恢复某一块屏的遮罩。
+   *
+   * 只改 opacity，窗口一直活着 —— 这是换屏不闪的前提。
+   * 活动屏的遮罩置为全透明并放行鼠标：它可能压在截图窗口之上，不放行就会吃掉点击。
+   */
+  private setBlockDim(displayId: number, dimmed: boolean): void {
+    const $win = this.$blockWins.get(displayId);
+    if (!$win || $win.isDestroyed()) {
+      return;
+    }
+    $win.setIgnoreMouseEvents(!dimmed);
+    $win.setOpacity(dimmed ? BLOCK_OPACITY : 0);
+  }
+
+  /** 除活动屏外全部压暗（预截完成之后调，之前必须保持全透明） */
+  private revealBlockWindows(active: Display): void {
+    for (const id of this.$blockWins.keys()) {
+      this.setBlockDim(id, id !== active.id);
     }
   }
 
@@ -655,10 +1131,26 @@ export default class Screenshots extends Events {
     this.$blockWins.clear();
   }
 
+  /**
+   * 截一块屏。
+   *
+   * `onGrabbed` 在**像素已经抓到手**、还没开始编码的那一刻回调。
+   * 遮罩就靠它抢时间：`toPng` 编码一块 5K 屏要几百毫秒，等编码完再压暗，
+   * 用户看到的就是"另一块屏慢半拍才黑下去"。抓完就压暗，编码在后面慢慢做。
+   */
   private async capture(
     display: Display,
+    onGrabbed?: () => void,
   ): Promise<{ png: Buffer; image?: ShotImage | undefined }> {
     this.logger('SCREENSHOTS:capture');
+
+    // 兜底路径也可能走到，别让遮罩被压暗两次
+    let grabbed = false;
+    const grab = () => {
+      if (grabbed) return;
+      grabbed = true;
+      onGrabbed?.();
+    };
 
     try {
       let time = performance.now();
@@ -700,6 +1192,8 @@ export default class Screenshots extends Events {
       const image = await monitor.captureImage();
       const imageCost = Math.round(performance.now() - time);
       time = performance.now();
+      // 像素到手，屏幕内容已经定格：这时候压暗遮罩不会再影响这张图
+      grab();
 
       const buffer = await image.toPng(true);
       const pngCost = Math.round(performance.now() - time);
@@ -727,6 +1221,7 @@ export default class Screenshots extends Events {
         'SCREENSHOTS:capture 耗时 desktopCapturer.getSources %dms',
         Math.round(performance.now() - time),
       );
+      grab();
 
       let source: DesktopCapturerSource | undefined;
       // Linux系统上，screen.getDisplayNearestPoint 返回的 Display 对象的 id
@@ -751,8 +1246,10 @@ export default class Screenshots extends Events {
             if (!item.thumbnail) return false;
             const size = item.thumbnail.getSize();
             // 允许小误差（1像素）处理舍入问题
-            return Math.abs(size.width - expectedWidth) <= 1
-              && Math.abs(size.height - expectedHeight) <= 1;
+            return (
+              Math.abs(size.width - expectedWidth) <= 1 &&
+              Math.abs(size.height - expectedHeight) <= 1
+            );
           });
         }
 
@@ -763,7 +1260,9 @@ export default class Screenshots extends Events {
           // 如果当前display是cursor所在的显示器，尝试通过name匹配或使用第一个source
           if (nearestDisplay.id === display.id) {
             // 某些系统上，source的name可能包含显示器信息
-            source = sources.find((item) => item.name && item.name.includes(display.id.toString()));
+            source = sources.find(
+              (item) => item.name && item.name.includes(display.id.toString()),
+            );
             // 如果name匹配也失败，使用第一个source作为fallback
             if (!source) {
               [source] = sources;
@@ -793,33 +1292,128 @@ export default class Screenshots extends Events {
   }
 
   /**
-   * 两个拾取源的下发顺序。渲染端把 `windows` 为空理解成"这台机器/这个平台拿不到窗口几何"，
-   * 于是拾取和吸附都改由元素矩形顶上；所以这两条通道**不能并行**，必须等窗口那批先到，
-   * 否则元素矩形抢先到达的那几十毫秒里，光标压在窗口上会被切成一堆碎框
-   * （拖框也会被窗口内部的卡片边吸住）—— 0.7.0 没有这个问题，因为窗口矩形和截图在同一个载荷里。
+   * 每块屏的窗口矩形 / 元素矩形。
+   *
+   * 枚举是全局的（物理坐标），投到某块屏只是纯计算 —— 所以**一次截图只算一遍**：
+   * 开场就把所有屏幕都算好存着，换屏时只把缓存里的数组发下去，绝不再跑识别。
+   *
+   * 以前是每次换屏都重算：`getWindows` 里有同步拍窗口甄别覆盖层（实测 0.1~5s），
+   * 主线程被占着，下一次换屏的绘制回执迟迟到不了 —— 表现就是"窗口追不上光标、一路闪"。
    */
-  private async sendWindowsThenEdges(
+  private windowsByDisplay = new Map<number, Bounds[]>();
+  private edgesByDisplay = new Map<number, Bounds[]>();
+  /** 每块屏的 RGBA 像素，供 hover 时做原生分辨率精修 */
+  private edgePixels = new Map<number, Pixels>();
+  /** 渲染端已经解码好底图的屏幕，换过去时不用再传 PNG、也不用等解码 */
+  private decodedInRenderer = new Set<number>();
+
+  /** 置顶守卫的定时器，见 `startTopMostGuard` */
+  private topMostTimer: NodeJS.Timeout | null = null;
+
+  /** 把某块屏的底图先塞给渲染端解码（只解码不上屏），换屏时就能直接换元素 */
+  private preloadRenderer(display: Display): void {
+    const shot = this.shots.get(display.id);
+    if (!shot || this.decodedInRenderer.has(display.id)) {
+      return;
+    }
+    if (this.$view.webContents.isDestroyed()) {
+      return;
+    }
+    this.$view.webContents.send('SCREENSHOTS:preload', display, shot.png);
+  }
+
+  /**
+   * 把某块屏的识别结果发给渲染端。
+   *
+   * 纯读缓存 + 一次 IPC，1ms 量级 —— 换屏路径上只允许出现这个。
+   * 缓存还没算好（刚开屏那几十毫秒）就先什么都不发，渲染端退化成手动框选，
+   * 算完之后换回来就有了。
+   */
+  private sendRecognition(display: Display, seq: number): void {
+    if (
+      seq !== this.captureSeq ||
+      !this.capturing ||
+      !this.$win ||
+      this.$win.isDestroyed()
+    ) {
+      return;
+    }
+
+    const windows = this.windowsByDisplay.get(display.id);
+    if (windows) {
+      this.captureWindows = windows;
+      this.$view.webContents.send('SCREENSHOTS:windows', windows);
+    }
+
+    if (!this.isDetectEdges) {
+      return;
+    }
+    const edges = this.edgesByDisplay.get(display.id);
+    if (!edges) {
+      return;
+    }
+    const pixels = this.edgePixels.get(display.id);
+    if (pixels) {
+      this.edgeSource = { pixels, display };
+    }
+    this.$view.webContents.send('SCREENSHOTS:edges', edges);
+  }
+
+  /**
+   * 开场把**所有屏幕**的识别结果一次算完并缓存，之后换屏只下发。
+   *
+   * 先算活动屏（用户马上要 hover），再依次算其他屏；算的过程中用户可能已经在切屏了，
+   * 所以每一步都检查 `capturing`。
+   */
+  private async startRecognition(
     shot: { image?: ShotImage | undefined },
-    display: Display,
+    active: Display,
     seq: number,
   ): Promise<void> {
-    await this.sendWindows(display, seq);
+    await this.computeWindows(active);
+    this.sendRecognition(active, seq);
     if (this.isDetectEdges) {
-      await this.detectEdges(shot, display, seq);
+      await this.computeEdges(shot, active);
+      this.sendRecognition(active, seq);
+    }
+
+    for (const display of screen.getAllDisplays().map(toDisplay)) {
+      if (display.id === active.id || !this.capturing) {
+        continue;
+      }
+      const other = this.shots.get(display.id);
+      if (!other) {
+        continue;
+      }
+      // 先把底图丢给渲染端解码（和下面的识别并行跑），换过去时就不用等解码
+      this.preloadRenderer(display);
+      await this.computeWindows(display);
+      if (this.isDetectEdges) {
+        await this.computeEdges(other, display);
+      }
     }
   }
 
   /**
-   * 窗口识别与锁边的数据源。刻意排在截图**显示之后**：`Window.all()` 在窗口多的
-   * 机器上是几十到几百毫秒，卡在前面就是拖慢锁屏，而它只服务 hover 和吸附。
+   * 算出某块屏的窗口矩形并缓存。
+   *
+   * **不在换屏路径上调用** —— 只在开场、或缓存缺失时跑一次。
+   * 刻意排在截图**显示之后**：`Window.all()` 在窗口多的机器上是几十毫秒到几秒，
+   * 卡在前面就是拖慢锁屏，而它只服务 hover 和吸附。
    */
-  private async sendWindows(display: Display, seq: number): Promise<void> {
+  private async computeWindows(display: Display): Promise<Bounds[]> {
+    const cached = this.windowsByDisplay.get(display.id);
+    if (cached) {
+      return cached;
+    }
+
     const startedAt = performance.now();
-    const windows = await getWindows(display, this.logger);
+    const windows = await getWindows(display, this.logger, true);
     this.logger(
-      '窗口识别 %d 条 %dms（截图显示之后）',
+      '窗口识别 %d 条 %dms（%d 号屏）',
       windows.length,
       Math.round(performance.now() - startedAt),
+      display.id,
     );
 
     if (!windows.length) {
@@ -834,54 +1428,50 @@ export default class Screenshots extends Events {
       this.logger('窗口识别不可用（空列表）%s', reason);
     }
 
-    // 中途换屏或结束了，这批矩形对应的是另一块屏，发过去会错位
-    if (
-      seq !== this.captureSeq ||
-      !this.capturing ||
-      !this.$win ||
-      this.$win.isDestroyed()
-    ) {
-      return;
-    }
-
-    this.captureWindows = windows;
-    this.$view.webContents.send('SCREENSHOTS:windows', windows);
+    this.windowsByDisplay.set(display.id, windows);
+    return windows;
   }
 
   /**
-   * 元素级识别（`edge_det`）。截图窗口显示之后才异步执行，所以不拖慢截图出现的速度；
-   * 整窗拾取由渲染端保证以窗口数据为准，这里只补窗口盖不到的地方。
+   * 元素级识别（`edge_det`），算完缓存。
    *
+   * 整窗拾取由渲染端保证以窗口数据为准，这里只补窗口盖不到的地方。
    * 整屏这一遍为了压耗时可能会降采样，边框只当"候选集"用；
    * 贴得准的矩形由 `SCREENSHOTS:edgeRegion` 的邻域精修按原生分辨率现算。
+   *
+   * 同样**不在换屏路径上调用**：一次截图里每块屏只算一遍，换屏只下发缓存。
    */
-  private async detectEdges(
+  private async computeEdges(
     shot: { image?: ShotImage | undefined },
     display: Display,
-    seq: number,
-  ): Promise<void> {
+  ): Promise<Bounds[]> {
+    const cached = this.edgesByDisplay.get(display.id);
+    if (cached) {
+      return cached;
+    }
     if (!shot.image) {
       // 兜底的截图路径（desktopCapturer）拿不到 RGBA
-      return;
-    }
-    // 这一遍排在窗口下发之后，那几十到几百毫秒里截图可能已经结束了，
-    // 别为一幅不会再被拾取的图拷 22MB 像素、再跑一遍 WASM
-    if (!this.capturing || seq !== this.captureSeq) {
-      return;
+      return [];
     }
 
     const debugOn = isEdgesDebugEnabled();
     const startedAt = performance.now();
     // 调试模式要同一份像素再画一次框，别为了省一次拷贝把缓冲搞成两份语义
     const pixels = this.toPixels(shot.image, display, debugOn);
-    const { bounds, rawBorders } = await getEdges(pixels, display, this.logger, {
-      thresholds: this.edgeThresholds,
-      debug: debugOn,
-    });
+    const { bounds, rawBorders } = await getEdges(
+      pixels,
+      display,
+      this.logger,
+      {
+        thresholds: this.edgeThresholds,
+        debug: debugOn,
+      },
+    );
     this.logger(
-      '元素检测 %d 条 %dms',
+      '元素检测 %d 条 %dms（%d 号屏）',
       bounds.length,
       Math.round(performance.now() - startedAt),
+      display.id,
     );
 
     if (debugOn && rawBorders) {
@@ -892,7 +1482,7 @@ export default class Screenshots extends Events {
             pixels,
             rawBorders,
             bounds,
-            windows: this.captureWindows,
+            windows: this.windowsByDisplay.get(display.id) ?? [],
           }),
           rawBorders.length,
         );
@@ -901,19 +1491,10 @@ export default class Screenshots extends Events {
       }
     }
 
-    // 中途换屏或结束了，这批矩形对应的是另一张图，发过去会错位
-    if (
-      seq !== this.captureSeq ||
-      !this.capturing ||
-      !this.$win ||
-      this.$win.isDestroyed()
-    ) {
-      return;
-    }
-
-    // 换屏后这张图作废，新的 detectEdges 会重新填
-    this.edgeSource = { pixels, display };
-    this.$view.webContents.send('SCREENSHOTS:edges', bounds);
+    // 像素留给 hover 时的原生分辨率精修，换屏时跟着缓存一起换
+    this.edgePixels.set(display.id, pixels);
+    this.edgesByDisplay.set(display.id, bounds);
+    return bounds;
   }
 
   /**
@@ -986,7 +1567,11 @@ export default class Screenshots extends Events {
    *
    * `reuse` 给调试模式用：同一份像素要喂检测和调试图两次，少拷一次是 22MB。
    */
-  private toPixels(image: ShotImage, display: Display, reuse?: boolean): Pixels {
+  private toPixels(
+    image: ShotImage,
+    display: Display,
+    reuse?: boolean,
+  ): Pixels {
     const raw = image.toRawSync();
     const buf = reuse
       ? (raw.buffer.slice(
@@ -1115,6 +1700,31 @@ export default class Screenshots extends Events {
         this.endCapture();
       },
     );
+
+    /**
+     * 渲染端画完一帧的回执：换屏时窗口就是等这个才搬过去的，见 `switchDisplay`。
+     */
+    ipcMain.on('SCREENSHOTS:painted', (event) => {
+      if (event.sender !== this.$view.webContents) {
+        return;
+      }
+      this.paintWaiter?.resolve();
+    });
+
+    /**
+     * 渲染端说"这块屏的底图我解好了"。
+     *
+     * 记下来之后，换到这块屏就不用再传一遍几 MB 的 PNG，也不用等它解码 ——
+     * 换屏路径上只剩下"换元素"和"搬窗口"两件事。
+     */
+    ipcMain.on('SCREENSHOTS:preloaded', (event, displayId: number) => {
+      if (event.sender !== this.$view.webContents) {
+        return;
+      }
+      if (typeof displayId === 'number') {
+        this.decodedInRenderer.add(displayId);
+      }
+    });
 
     /**
      * 光标邻域的原生分辨率精修请求，只有开了 detectEdges 才有意义

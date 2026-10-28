@@ -1,13 +1,14 @@
 {
   "name": "@qs-coder/electron-screenshots",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "electron 截图插件",
   "types": "lib/index.d.ts",
   "main": "lib/index.cjs.js",
   "module": "lib/index.js",
   "type": "commonjs",
   "files": [
-    "lib/**"
+    "lib/**",
+    "!scripts"
   ],
   "scripts": {
     "prepublishOnly": "npm run build",

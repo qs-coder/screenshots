@@ -42,6 +42,22 @@ contextBridge.exposeInMainWorld('screenshots', {
     ipcRenderer.send('SCREENSHOTS:reset');
   },
   /**
+   * 新一张截图已经画到屏幕上。
+   * 主进程换屏时要等这个回执才搬窗口，否则窗口落地的头几帧是空/旧内容，看着就是闪一下。
+   */
+  painted: () => {
+    ipcRenderer.send('SCREENSHOTS:painted');
+  },
+  /**
+   * 某块屏的底图已经解码好、放进渲染端缓存了。
+   *
+   * 主进程据此知道"这块屏换过去不用等解码"，换屏就能直接换图不等绘制。
+   * 见 `Screenshots#preloadRenderer`。
+   */
+  preloaded: (displayId: number) => {
+    ipcRenderer.send('SCREENSHOTS:preloaded', displayId);
+  },
+  /**
    * 请求光标邻域的原生分辨率元素识别，结果从 `on('edges-precise')` 回来。
    * 只有主进程开了 detectEdges 才有响应。
    */

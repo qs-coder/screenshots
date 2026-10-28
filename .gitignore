@@ -61,3 +61,9 @@ typings/
 .next
 
 /lib
+
+# 本地开发用的独立 .app（脚本生成）
+.dev-app/
+
+# 本地 AI 助手的工作目录
+.workbuddy-ai/
