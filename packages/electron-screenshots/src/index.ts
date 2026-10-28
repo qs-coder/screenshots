@@ -372,7 +372,21 @@ export default class Screenshots extends Events {
     }
     mark('promptScreenPermission');
 
-    // 建窗口里的 reset 要等渲染端回执，所以先把渲染端就绪排在最前面（通常应用启动时就已 resolve）
+    /**
+     * 先把屏幕**冻住**，再去等渲染端就绪。
+     *
+     * 渲染端首次启动要两三秒（冷启动更久，实测 2.5~7s），而用户按下截图后往往
+     * 马上就去点任务栏、开别的程序。如果等就绪再截，这些窗口就会被一起拍进"快照"，
+     * 而快照必须是一开始那一刻的屏幕 —— 之后打开的所有东西都只应该被它盖在下面。
+     *
+     * 截图不依赖渲染端，所以这里只发起、不等待：真正的等待和建窗口一起做。
+     */
+    const shotPromise = this.capture(display);
+    // 这里只是先挂一个处理者：截图失败时下面等渲染端的这段时间不会变成
+    // unhandledRejection；错误本身仍由 Promise.all 抛给调用方
+    shotPromise.catch(() => {});
+
+    // 建窗口里的 reset 要等渲染端回执，所以先把渲染端就绪排在最前面
     await this.isReady;
     mark('isReady');
 
@@ -381,7 +395,7 @@ export default class Screenshots extends Events {
      * 于是第一帧出现的时间约等于 captureImage + toPng，而不是两者相加。
      */
     const [shot, $win] = await Promise.all([
-      this.capture(display),
+      shotPromise,
       this.createWindow(display),
     ]);
     mark('capture + createWindow');
@@ -666,7 +680,11 @@ export default class Screenshots extends Events {
     // 中途插拔屏幕时补齐屏蔽窗口（正常情况下这里什么都不做）
     this.ensureBlockWindows();
     const shot = await this.shotOf(display);
-    const seq = ++this.captureSeq;
+    // 换屏不算"新的一轮截图"：`captureSeq` 只在 startCapture 里递增。
+    // 以前这里也 ++，而开场识别要一两秒才跑完 —— 用户在识别算完之前把光标划到
+    // 另一块屏，整轮结果都会被判成过期丢掉，之后两块屏都不再有高亮/吸附，
+    // 看起来就是"窗口边缘完全识别不出来"。识别结果该不该下发，改由屏 id 判断。
+    const seq = this.captureSeq;
 
     // 1. 渲染端换图并画好这一帧（此时窗口还在旧屏上，用户看不到这次替换）
     await this.prepareRenderer(display, shot.png);
@@ -1163,7 +1181,8 @@ export default class Screenshots extends Events {
         y: display.y + display.height / 2,
       };
       if (process.platform === 'win32') {
-        point = screen.screenToDipPoint(point);
+        // DIP → 物理：`Monitor.fromPoint` 要的是物理像素，方向反了会命中别的屏（见 getMonitor）
+        point = screen.dipToScreenPoint(point);
       }
       const monitor = Monitor.fromPoint(point.x, point.y);
       const fromPointCost = Math.round(performance.now() - time);
@@ -1338,6 +1357,14 @@ export default class Screenshots extends Events {
     ) {
       return;
     }
+    // 识别结果是"这块屏的"，不是"这一轮截图的"：换屏早于识别算完时，
+    // 旧屏的结果绝不能贴到新屏上（坐标原点不同，框会整体错位）。
+    // 换屏监听还没启动（开场那几十毫秒）时没有"当前屏"，照常下发。
+    const current = this.screenWatcher
+      .currentDisplay as Partial<Display> | null | undefined;
+    if (current && current.id !== display.id) {
+      return;
+    }
 
     const windows = this.windowsByDisplay.get(display.id);
     if (windows) {
@@ -1388,8 +1415,12 @@ export default class Screenshots extends Events {
       // 先把底图丢给渲染端解码（和下面的识别并行跑），换过去时就不用等解码
       this.preloadRenderer(display);
       await this.computeWindows(display);
+      // 用户可能已经在这几十/几百毫秒里换到这块屏了；此时的开场下发早就过去了，
+      // 不在这里补一次，这块屏的高亮和吸附就永远不会出现（只有再切一次屏才有）
+      this.sendRecognition(display, seq);
       if (this.isDetectEdges) {
         await this.computeEdges(other, display);
+        this.sendRecognition(display, seq);
       }
     }
   }
@@ -1547,9 +1578,14 @@ export default class Screenshots extends Events {
       bounds[0],
     );
 
+    const current = this.screenWatcher
+      .currentDisplay as Partial<Display> | null | undefined;
     if (
       seq !== this.captureSeq ||
       !this.capturing ||
+      // 换屏后这份结果对应的是旧屏的图，坐标原点都对不上：以前靠 switchDisplay 里
+      // ++captureSeq 顺带拦掉，现在换屏不再动 captureSeq，得在这里按屏判断
+      (current && current.id !== display.id) ||
       !this.$win ||
       !this.$view ||
       this.$win.isDestroyed() ||

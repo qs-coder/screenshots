@@ -23,7 +23,10 @@ export default async function getMonitor(
     y: display.y + display.height / 2,
   };
   if (process.platform === 'win32') {
-    point = screen.screenToDipPoint(point);
+    // `Display` 是 DIP，`Monitor.fromPoint` 和 node-screenshots 的其他坐标一样是物理像素，
+    // 这里要做的是 DIP → 物理（`dipToScreenPoint`）；用反了在缩放屏 + 多屏混排时
+    // 会落到另一块屏上，拿错原点和缩放比，整份窗口列表都跟着错位。
+    point = screen.dipToScreenPoint(point);
   }
 
   return Monitor.fromPoint(point.x, point.y);

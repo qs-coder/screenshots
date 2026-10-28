@@ -48,6 +48,16 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
   const lastRegionRef = useRef<string | null>(null);
   // 上一次发起精修的光标位置，结果回来要确认光标还没走远
   const cursorRef = useRef<Point | null>(null);
+  // 最后一次 pointermove 的窗口内坐标，以及当时的窗口尺寸。
+  // 窗口/元素数据常常晚于光标到达（开场枚举要几百毫秒，Windows 上首帧解码还得几秒），
+  // 用户停在目标窗口上不动时没有新的 pointermove，只能靠这份坐标补算高亮。
+  // 尺寸一起记是因为客户端坐标的原点跟着窗口走：换到另一块屏后旧坐标会整体错位。
+  const lastClientRef = useRef<{
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null>(null);
   // 用来识别 image 的身份变化（换屏、新一轮截图），见下面的重置
   const lastImageRef = useRef<HTMLImageElement | null>(null);
 
@@ -127,8 +137,41 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
     [windows, edges]
   );
 
+  /**
+   * 按光标位置重算高亮。pointermove 和"识别结果到达"都会调用它：
+   * 后者是因为开场识别要几百毫秒（Windows 上还要加首帧解码），
+   * 用户往往已经把鼠标停在窗口上不动了 —— 只靠 pointermove 的话高亮永远不出现。
+   */
+  const syncHover = useCallback(
+    (pos: Position | null) => {
+      const next = !bounds && pos ? pickAt(pos.x, pos.y) : null;
+      hoverRef.current = next;
+      setHover(next);
+      // 落在窗口之外才需要精修（窗口本来就有精确边界）；
+      // 已经贴准过的矩形再问一遍只是白花一次 worker
+      if (
+        next &&
+        pos &&
+        next !== preciseRef.current &&
+        !getWindowAt(windows, pos.x, pos.y)
+      ) {
+        cursorRef.current = pos;
+        requestRegion(next);
+      }
+    },
+    [bounds, pickAt, windows, requestRegion]
+  );
+
   useEffect(() => {
     const onPointerMove = (e: PointerEvent) => {
+      // 底图还没提交时页面里没有 elRef，但坐标一样要记下来：
+      // 用户经常在这几百毫秒里就把鼠标挪到目标窗口上，之后不再动了
+      lastClientRef.current = {
+        x: e.clientX,
+        y: e.clientY,
+        width: window.innerWidth,
+        height: window.innerHeight,
+      };
       let pos: Position | null = null;
       if (elRef.current) {
         const rect = elRef.current.getBoundingClientRect();
@@ -150,20 +193,7 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
 
       if (!pointRef.current) {
         // 只有没在拖框时才做识别，否则高亮层会在拖动过程中跟着闪
-        const next = !bounds && pos ? pickAt(pos.x, pos.y) : null;
-        hoverRef.current = next;
-        setHover(next);
-        // 落在窗口之外才需要精修（窗口本来就有精确边界）；
-        // 已经贴准过的矩形再问一遍只是白花一次 worker
-        if (
-          next &&
-          pos &&
-          next !== preciseRef.current &&
-          !getWindowAt(windows, pos.x, pos.y)
-        ) {
-          cursorRef.current = pos;
-          requestRegion(next);
-        }
+        syncHover(pos);
         return;
       }
       // Alt/⌥ 是吸附的逃生口，需要精确到像素时按住它
@@ -216,7 +246,37 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", onPointerUp);
     };
-  }, [updateBounds, onStart, onStop, bounds, pickAt, requestRegion, windows, boundsDispatcher]);
+  }, [updateBounds, onStart, onStop, pickAt, syncHover, boundsDispatcher]);
+
+  // 底图或识别结果晚到：光标没动也要把高亮和放大镜补上
+  useEffect(() => {
+    if (!url || !image || pointRef.current) {
+      return;
+    }
+    const last = lastClientRef.current;
+    const el = elRef.current;
+    if (!last || !el) {
+      return;
+    }
+    // 窗口尺寸变了说明刚换过屏，旧坐标原点属于上一块屏，用它只会把框贴错地方
+    if (
+      last.width !== window.innerWidth ||
+      last.height !== window.innerHeight
+    ) {
+      return;
+    }
+    const rect = el.getBoundingClientRect();
+    const inside =
+      last.x >= rect.left &&
+      last.y >= rect.top &&
+      last.x <= rect.right &&
+      last.y <= rect.bottom;
+    const pos = inside ? { x: last.x - rect.x, y: last.y - rect.y } : null;
+    if (pos) {
+      setPosition(pos);
+    }
+    syncHover(pos);
+  }, [syncHover, url, image]);
 
   // 精修结果异步回来：第一条就是发起时那个粗矩形（可能已被贴准），光标走远了就丢掉
   useEffect(() => {
@@ -250,6 +310,10 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
     // 只看 `!image || bounds` 判断不到这种情况，上一张图的精修矩形会贴在新图上
     const isNewImage = image !== lastImageRef.current;
     lastImageRef.current = image;
+    if (!image) {
+      // 一轮截图结束：下一轮的光标位置和这一轮无关
+      lastClientRef.current = null;
+    }
     if (isNewImage || !image || bounds) {
       // 重置位置
       setPosition(null);
