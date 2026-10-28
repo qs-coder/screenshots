@@ -1,6 +1,6 @@
 {
   "name": "@qs-coder/react-screenshots",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "a screenshot cropper tool by react",
   "type": "module",
   "exports": {

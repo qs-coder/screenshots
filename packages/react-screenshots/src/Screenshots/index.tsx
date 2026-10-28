@@ -14,6 +14,12 @@ import zhCN from './zh_CN';
 
 export interface ScreenshotsProps {
   url?: string;
+  /**
+   * 与 `url` 成对传入的**已解码**底图元素。
+   * Electron 那边解码完才提交，所以底图不会出现"已换 url 但图片还没加载"的空窗期；
+   * 不传时按 `url` 自己加载（web 端、或者宿主自己先解码好的场景）。
+   */
+  imageElement?: HTMLImageElement | null;
   width: number;
   height: number;
   lang?: Partial<Lang>;
@@ -34,6 +40,7 @@ export interface ScreenshotsProps {
 
 export default function Screenshots({
   url,
+  imageElement,
   width,
   height,
   lang,
@@ -44,7 +51,7 @@ export default function Screenshots({
 }: ScreenshotsProps): ReactElement {
   const propsRef = useRef(props);
   propsRef.current = props;
-  const image = useGetLoadedImage(url);
+  const image = useGetLoadedImage(url, imageElement);
   const canvasContextRef = useRef<CanvasRenderingContext2D>(null);
   const emitterRef = useRef<Emitter>({});
   const [history, setHistory] = useState<History>({
@@ -159,13 +166,9 @@ export default function Screenshots({
     [call, reset],
   );
 
-  const onStart = useCallback(
-    () => call('onStart'), []
-  )
+  const onStart = useCallback(() => call('onStart'), []);
 
-  const onStop = useCallback(
-    () => call('onStop'), []
-  )
+  const onStop = useCallback(() => call('onStop'), []);
 
   // url变化，重置截图区域
   // biome-ignore lint/correctness/useExhaustiveDependencies: useLayoutEffect only cares about url
