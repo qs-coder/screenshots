@@ -1,0 +1,24 @@
+packages/react-screenshots/README.md
+  h_b66c7b30fc5084 110-115,134
+packages/react-screenshots/package.json
+  h_b66c7b30fc5084 3
+packages/react-screenshots/src/Screenshots/index.tsx
+  h_b66c7b30fc5084 17-22,43,54,169,171
+packages/react-screenshots/src/Screenshots/useGetLoadedImage.ts
+  h_b66c7b30fc5084 3-9,12,14-16,19-23,43
+packages/react-screenshots/src/electron/app.tsx
+  h_b66c7b30fc5084 18-20,27-37,54-55,58-59,76-89,91-94,98-153,155-166,179,183-185,187-190,195,203,208-209,211,231
+packages/react-screenshots/src/global.d.ts
+  h_b66c7b30fc5084 16-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "276dd84906f21351c5bbe7499da7b9eebdbccd54",
+  "prompts": {},
+  "humans": {
+    "h_b66c7b30fc5084": {
+      "author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  }
+}
