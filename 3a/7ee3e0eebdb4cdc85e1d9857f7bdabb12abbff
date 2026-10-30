@@ -1,0 +1,22 @@
+packages/electron-screenshots/README.md
+  h_b66c7b30fc5084 103,105-118,131
+packages/electron-screenshots/package.json
+  h_b66c7b30fc5084 3
+packages/electron-screenshots/src/demo.ts
+  h_b66c7b30fc5084 141-146
+packages/electron-screenshots/src/index.ts
+  h_b66c7b30fc5084 10,174-185,225-235,480-489,767-834,842-845,1097-1105,1787,1818-1819,1832-1835
+packages/react-screenshots/package.json
+  h_b66c7b30fc5084 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3a7ee3e0eebdb4cdc85e1d9857f7bdabb12abbff",
+  "prompts": {},
+  "humans": {
+    "h_b66c7b30fc5084": {
+      "author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  }
+}
