@@ -7,6 +7,7 @@ import {
   type DesktopCapturerSource,
   desktopCapturer,
   dialog,
+  globalShortcut,
   ipcMain,
   nativeImage,
   screen,
@@ -170,6 +171,18 @@ export default class Screenshots extends Events {
   /** 保存对话框期间不能抢焦点、不能重新置顶 */
   private isDialogOpen = false;
 
+  /**
+   * 这一轮截图已经完整可见（底图亮出来、可以交互了）。
+   *
+   * ESC 只在这之后才生效：之前窗口还是 opacity 0，用户看不见任何东西，
+   * 此时允许取消会让 `startCapture` 的后续步骤（下发识别、开屏幕监听）跑在一个
+   * 已经收尾的会话上。
+   */
+  private captureReady = false;
+
+  /** ESC 全局快捷键是否由本库持有（见 `registerEscShortcut`） */
+  private escRegistered = false;
+
   /** 非活动屏幕上的屏蔽窗口，key 为 display.id */
   private $blockWins = new Map<number, BrowserWindow>();
 
@@ -209,6 +222,17 @@ export default class Screenshots extends Events {
     this.$view.webContents.loadURL(
       `file://${require.resolve('@qs-coder/react-screenshots/dist/electron.html')}`,
     );
+    /**
+     * ESC 兜底：键盘焦点在渲染端时直接由 webContents 收下。
+     *
+     * 主路径是 `registerEscShortcut()` 的全局快捷键（不依赖焦点）；这条只在
+     * 全局快捷键注册失败（被别的应用占用）时顶上，两者是同一个出口。
+     */
+    this.$view.webContents.on('before-input-event', (_event, input) => {
+      if (input.type === 'keyDown' && input.key === 'Escape') {
+        this.cancelByEsc();
+      }
+    });
     if (opts?.lang) {
       this.setLang(opts.lang);
     }
@@ -452,6 +476,16 @@ export default class Screenshots extends Events {
       }
     }
     mark('send capture');
+
+    /**
+     * 底图已经亮出来了，从这一刻起 ESC 才允许取消。
+     *
+     * 全局快捷键放在这里而不是 `show` 之前：窗口先以 opacity 0 显示的那段时间
+     * 用户什么都看不见，这时候能取消的话，下面的识别与屏幕监听会跑在一个
+     * 已经收尾的会话上。
+     */
+    this.captureReady = true;
+    this.registerEscShortcut();
 
     /**
      * 两个拾取源都必须排在显示之后，而且要**先窗口后元素**。
@@ -731,12 +765,84 @@ export default class Screenshots extends Events {
   }
 
   /**
+   * 注册 ESC 取消截图。
+   *
+   * 上游为了 mac kiosk 支持删掉了渲染端的 keyup 监听，之后 ESC 只能靠宿主自己
+   * 在截图窗 `focus` 时 `globalShortcut.register('esc')`、`blur` 时注销，而且
+   * handler 里还要再判一次 `$win.isFocused()`。这条链路在打包环境里很脆：
+   * 宿主常常会先 `mainWindow.hide()` 再起截图（防截屏模式），进程瞬间没有可见
+   * 窗口，截图窗 show 出来时不一定能拿到前台/焦点 —— `focus` 不来，快捷键就一次
+   * 都没注册上；就算注册上了，焦点那一刻在屏蔽窗上，`isFocused()` 也会让 handler
+   * 静默 return。表现就是"截图卡在屏幕上，ESC 怎么按都没反应"。
+   *
+   * 所以改由库自己管：截图中注册、收尾时注销，门禁用 `captureReady` 而不是焦点，
+   * 只要这一轮截图还开着，不管焦点在谁身上 ESC 都生效。
+   *
+   * 注册前先 `unregister` 一次：按旧文档接入的宿主可能已经自己注册过 `esc`，
+   * 而 `globalShortcut.register` 对同一个键返回 false 且**保留旧回调**，
+   * 不清掉的话抢不过来，ESC 还是走的宿主那套带焦点门禁的逻辑。
+   */
+  private registerEscShortcut(): void {
+    if (this.escRegistered) {
+      return;
+    }
+    try {
+      // 让位给库自己：宿主的旧注册（带 isFocused 门禁）会挡住这次注册
+      globalShortcut.unregister('esc');
+      this.escRegistered = globalShortcut.register('esc', () => {
+        this.cancelByEsc();
+      });
+    } catch (err) {
+      this.escRegistered = false;
+      this.logger('注册 ESC 快捷键异常 %o', err);
+    }
+    this.logger(
+      '注册 ESC 快捷键 %s',
+      this.escRegistered ? '成功' : '失败（可能被其他应用占用）',
+    );
+  }
+
+  private unregisterEscShortcut(): void {
+    if (!this.escRegistered) {
+      return;
+    }
+    globalShortcut.unregister('esc');
+    this.escRegistered = false;
+  }
+
+  /**
+   * ESC / 键盘兜底的统一出口，和渲染端发来 `SCREENSHOTS:cancel` 走同一条事件链，
+   * 所以宿主只需要监听 `cancel`，不用再自己接键盘。
+   */
+  private cancelByEsc(): void {
+    if (!this.captureReady || this.isDialogOpen) {
+      return;
+    }
+    this.logger('ESC 取消截图');
+    this.handleCancel();
+  }
+
+  /** 取消截图；宿主可以 `preventDefault` 拦下（比如改成二次确认） */
+  private handleCancel(): void {
+    const event = new Event();
+    this.emit('cancel', event);
+    if (event.defaultPrevented) {
+      return;
+    }
+    this.endCapture();
+  }
+
+  /**
    * 结束截图
    */
   public async endCapture(): Promise<void> {
     this.logger('endCapture');
     // 先停置顶守卫，否则它会一边拆窗口一边把窗口重新抬起来
     this.stopTopMostGuard();
+    // 会话已经结束，ESC 立刻失效：晚一步的话，收尾这几百毫秒里按 ESC
+    // 会再走一遍 cancel → endCapture，把宿主的回调打两次
+    this.captureReady = false;
+    this.unregisterEscShortcut();
     // 停止屏幕监听
     this.stopScreenWatcher();
     this.capturing = false;
@@ -988,6 +1094,15 @@ export default class Screenshots extends Events {
         return;
       }
       this.raiseAll();
+      /**
+       * ESC 自愈。按旧文档接入的宿主会在截图窗 `blur` 时自己
+       * `globalShortcut.unregister('esc')` —— 同一个应用、同一个键，那一下会把
+       * 库注册的快捷键一并注销，ESC 又变回"没反应"。这里每拍确认一次，被注销就补回来。
+       */
+      if (this.captureReady && !globalShortcut.isRegistered('esc')) {
+        this.escRegistered = false;
+        this.registerEscShortcut();
+      }
     }, 400);
   }
 
@@ -1669,13 +1784,7 @@ export default class Screenshots extends Events {
      */
     ipcMain.on('SCREENSHOTS:cancel', () => {
       this.logger('SCREENSHOTS:cancel');
-
-      const event = new Event();
-      this.emit('cancel', event);
-      if (event.defaultPrevented) {
-        return;
-      }
-      this.endCapture();
+      this.handleCancel();
     });
 
     /**
@@ -1706,6 +1815,8 @@ export default class Screenshots extends Events {
         const milliseconds = padStart(time.getMilliseconds(), 3, '0');
 
         this.isDialogOpen = true;
+        // 对话框开着的时候 ESC 必须留给对话框自己，否则用户按 ESC 关不掉它
+        this.unregisterEscShortcut();
         this.$win.setAlwaysOnTop(false);
 
         const { canceled, filePath } = await dialog
@@ -1718,6 +1829,10 @@ export default class Screenshots extends Events {
           })
           .finally(() => {
             this.isDialogOpen = false;
+            // 对话框关了、截图还开着：把 ESC 还回来
+            if (this.captureReady) {
+              this.registerEscShortcut();
+            }
           });
 
         if (!this.$win) {

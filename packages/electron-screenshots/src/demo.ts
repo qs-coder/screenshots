@@ -129,20 +129,6 @@ app.whenReady().then(() => {
     screenshots.startCapture();
   });
 
-  screenshots.on('windowCreated', ($win) => {
-    $win.on('focus', () => {
-      globalShortcut.register('esc', () => {
-        if ($win?.isFocused()) {
-          screenshots.endCapture();
-        }
-      });
-    });
-
-    $win.on('blur', () => {
-      globalShortcut.unregister('esc');
-    });
-  });
-
   // 防止不能关闭截图界面
   globalShortcut.register('ctrl+shift+q', () => {
     app.quit();
@@ -152,7 +138,12 @@ app.whenReady().then(() => {
   screenshots.on('ok', (_event, buffer, bounds) => {
     console.log('capture', buffer, bounds);
   });
-  // 点击取消按钮回调事件
+  /**
+   * ESC 取消截图由库自己接管（截图中注册全局快捷键、收尾时注销），宿主不用再挂
+   * `focus`/`blur` 去动态注册 —— 那套写法在"先 hide 主窗口再起截图"的打包路径上
+   * 拿不到焦点，ESC 会静默失效。
+   */
+  // 点击取消按钮 / 按 ESC 回调事件
   screenshots.on('cancel', () => {
     console.log('capture', 'cancel1');
     screenshots.setLang({
