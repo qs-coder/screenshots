@@ -2,6 +2,7 @@ import process from 'node:process';
 import { screen } from 'electron';
 import type { Monitor } from 'node-screenshots';
 import type { Display } from './getDisplay.js';
+import { getNodeScreenshots } from './loadNodeScreenshots.js';
 
 /**
  * 拿到 `display` 对应的 node-screenshots 显示器对象。
@@ -12,11 +13,17 @@ import type { Display } from './getDisplay.js';
  *
  * 按**中心点**匹配而不是按左上角：Windows 上多屏的原点是物理像素、
  * Electron 报的是 DIP，缩放比不是 1 时左上角根本对不上，只有中心点两套空间都落在同一块屏里。
+ *
+ * 加载走 `getNodeScreenshots()`（CJS require 优先、同步、进程级单例）—— asar 打包后
+ * `import('node-screenshots')` 会 ENOTDIR，见那个文件的说明。拿不到模块返回 null，
+ * 调用方退回用 `display` 自己的坐标，不抛错。
  */
-export default async function getMonitor(
-  display: Display,
-): Promise<Monitor | null> {
-  const { Monitor } = await import('node-screenshots');
+export default function getMonitor(display: Display): Monitor | null {
+  const mod = getNodeScreenshots();
+  if (!mod) {
+    return null;
+  }
+  const { Monitor } = mod;
 
   let point = {
     x: display.x + display.width / 2,

@@ -121,13 +121,49 @@ app.whenReady().then(() => {
     }
   }, 2000);
 
+  /**
+   * 防截屏模式：点截图先把宿主窗口 `hide()` 掉，截完/取消再显示回来。
+   *
+   * 这是宿主应用"截图里不能出现自己"的标准做法，也是**残影最容易出现的时序**：
+   * `hide()` 到 `startCapture()` 之间只有几个微任务，WindowServer 还没把窗口
+   * 从画面上摘掉，抓屏就会把宿主窗口一起拍进底图。库靠 `captureSettleMs`
+   * （默认 50ms）挡这件事，这里正好用来复现/验证。
+   *
+   * `DEMO_KEEP_WINDOW=1` 可以关掉它，对比"不 hide"的行为。
+   */
+  const antiCapture = process.env.DEMO_KEEP_WINDOW !== '1';
+
+  const startCapture = async () => {
+    if (antiCapture) {
+      mainWin.hide();
+    }
+    await screenshots.startCapture();
+  };
+
+  /** 截图结束（确定 / 取消 / 保存）后把宿主窗口还回来 */
+  const restoreHost = () => {
+    if (!mainWin.isDestroyed() && !mainWin.isVisible()) {
+      mainWin.show();
+    }
+  };
+
   // 只接受演示窗口自己发来的消息
   ipcMain.on('demo:startCapture', (event) => {
     if (event.sender !== mainWin.webContents) {
       return;
     }
-    screenshots.startCapture();
+    void startCapture();
   });
+
+  /**
+   * 无头驱动：`DEMO_AUTO_CAPTURE=1` 时启动 1.5s 后自动走一遍"点击"的流程，
+   * 方便用脚本验证这条时序，人不用去点按钮。
+   */
+  if (process.env.DEMO_AUTO_CAPTURE === '1') {
+    setTimeout(() => {
+      void startCapture();
+    }, 1500);
+  }
 
   // 防止不能关闭截图界面
   globalShortcut.register('ctrl+shift+q', () => {
@@ -137,6 +173,7 @@ app.whenReady().then(() => {
   // 点击确定按钮回调事件
   screenshots.on('ok', (_event, buffer, bounds) => {
     console.log('capture', buffer, bounds);
+    restoreHost();
   });
   /**
    * ESC 取消截图由库自己接管（截图中注册全局快捷键、收尾时注销），宿主不用再挂
@@ -150,10 +187,12 @@ app.whenReady().then(() => {
       operation_ellipse_title: 'ellipse',
       operation_rectangle_title: 'rectangle',
     });
+    restoreHost();
   });
   // 点击保存按钮回调事件
   screenshots.on('save', (_event, buffer, bounds) => {
     console.log('capture', buffer, bounds);
+    restoreHost();
   });
 });
 

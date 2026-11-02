@@ -191,6 +191,21 @@ const screenshots = new Screenshots({
 
   这从"只有 Windows"扩展到了**所有平台**。Windows 上是因为任务栏自身是 topmost 窗口，`setAlwaysOnTop(true)` 默认的 `floating` 层级排在任务栏**之下**，点一下任务栏截图界面就会沉底，加上 `skipTaskbar` 之后没有任何入口可以点回来，看起来像"截图丢了"。macOS 上 `floating` 同样压不住各种常驻浮层（录屏指示器、输入法候选框、各种 HUD），被盖住时用户看到的是一半截图、一半别人的界面。注意 `Win+D`、`Alt+Tab` 这类系统快捷键无法拦截，只能在失焦后抢回焦点。
 
+- **防截屏模式下的"虚影/残影"**（`mainWindow.hide()` 之后立刻起截图）：抓屏拿到的是**调用那一刻屏幕上的合成结果**，而 `hide()` 要等 WindowServer 处理完才真的从画面上消失，中间只有几个微任务 —— 于是宿主的窗口原封不动地进了底图。实测（按窗口区域像素统计）：`hide()` 后 `+0ms` 抓，窗口像素占 26.0%（和可见时的 26.2% 一样）；`+16ms` 剩 0.3%（只剩边缘）；`+50ms` 才 0.00%。
+
+  所以 `capture()` 在本轮**第一次**抓屏前会先等 `captureSettleMs`（默认 50ms），这段等待和 `createWindow`（`reset` 要等渲染端回执）并行，实际几乎不增加"从点击到画面锁住"的耗时（实测 `startCapture` 总耗时里 `capture + createWindow` 仍是取两者较大者）。宿主如果自己做过渡动画、或者 hide 之后还有别的异步动作，把 `captureSettleMs` 调大即可；`0` 关闭。
+
+  要复测这条时序，跑 `npx electron scripts/ghost-check.cjs`（先 `npm run build`）：它拿一块纯品红无边框窗口当探针，统计 `hide()` 后 0/16/33/50ms 抓屏时矩形内的品红残留比例，同时打印 `node-screenshots` 的加载结果和兜底路径 `desktopCapturer` 第一帧的对照值。基线（窗口可见时）拿不到品红就说明没有屏幕录制权限，脚本会直接中止而不是给出误导性的"没有残影"。注意抓屏本身要几十上百毫秒，所以 +0ms 那一档的实际采样点已经晚于请求，低于这个量级的差异测不出来。
+
+  想看**完整链路**（`startCapture` → 底图进缓存）有没有残影，跑 `npx electron scripts/ghost-demo.cjs`：它摆一个品红宿主窗口，走"hide 后截图"的防截屏时序，再直接统计底图 PNG 里宿主窗口区域的品红占比；`GHOST_KEEP=1` 是**阳性对照**（不 hide，应该测到 ~100%），用来证明测量本身没失效。demo 自己也是这个时序：点「开始截图」会先 `hide()` 主窗口、截完或取消再显示回来，`DEMO_KEEP_WINDOW=1` 关掉它做对比，`DEMO_AUTO_CAPTURE=1` 让它在启动 1.5s 后自动走一遍（脚本驱动用，不用点按钮）。
+
+- **`node-screenshots` 必须用 CJS `require` 加载，不能用动态 `import()`**：`app.asar` 里走 ESM resolver 时，`packageResolve` 逐级 stat 会拼出 `.../app.asar/node_modules/@qs-coder/electron-screenshots/lib/node_modules/...`，而 `app.asar` 本身是**文件**，stat 直接 `ENOTDIR`，原生模块永远加载不成功（一轮 `startCapture` 刷四条 ENOTDIR）。后果是**两个症状同时出现**，很容易被误判成两个 bug：
+
+  1. 抓屏退到 `desktopCapturer.getSources` 兜底 —— 它是"新建采集流取第一帧"，第一帧可能是更早的合成结果，宿主刚 `hide()` 的窗口就在里面（又一层残影来源），而且整条路慢且不可控；
+  2. `Window.all()` 变成空列表 —— 窗口识别与锁边**完全失效**（没有任何高亮框），可截图像素是好的，所以"截图能用"推不出"模块加载成功"。
+
+  现在统一走 `loadNodeScreenshots.ts`，**同步**加载、进程级单例（成功/失败都只解析一次）：主进程 `require` → `createRequire(process.execPath)` 兜一次（非 Electron 环境也走这条），两条都失败就记下原因、**不抛在模块加载期**——顶层静态 `import 'node-screenshots'` 会让宿主 `require('@qs-coder/electron-screenshots')` 的那一刻直接崩掉，上面的降级路径也就全废了。`new Screenshots()` 里会先 `warmUpNodeScreenshots()` 预热一次，首次 `require` 的几毫秒落在宿主启动阶段而不是第一次截图；之后 `capture()` / `getWindows()` / `getMonitor()` 都只是同步取缓存。asar 内的 `.node` 由 Electron 的 `process.dlopen` 处理，不需要额外 `asarUnpack`。兜底路径也做了加固：取两次源、**丢掉第一帧**，并打一条 `抓屏退化到 desktopCapturer：…` 的警告 —— 真降级时日志里一眼能看见，不会再静默地变成"没有高亮 + 有残影"。
+
 - **点击到"画面锁住"的响应速度**：`startCapture` 按"先锁屏、再补数据"排列，顺序是 `capture(活动屏) ‖ 建窗口` → 建齐每块屏的遮罩（全透明，点击当场被吃掉）→ 截图窗口以 opacity 0 `show()` → 并行开始其他屏的预截（每块抓完像素就压暗那一块）→ 等渲染端画完这一帧 → opacity 1 亮出来。窗口枚举、元素识别都排在显示之后，所以从点击到画面静止的时间约等于 `captureImage + toPng`。
 
   截图窗口**先显示但完全透明**，而不是"等画完再 show"，也不是"先 show 再等图"：隐藏窗口里 rAF 不跑、解码也慢得离谱（实测首次解码要 1 秒以上、经常等不到），等回执再 show 只会让窗口更晚出现；可反过来先 show 又会让透明窗口把桌面直接透出来，图到了"啪"地换上去——开局这一下闪烁就是这么来的。所以取中间：先显示（渲染进程才会正常出帧）但看不见，画好了再亮出来，用户看到的第一帧就是完整的截图。渲染端万一卡住，等回执有超时兜底，且**兜底放行时也会把窗口亮出来**，不会留下一个看不见又点不掉的东西。
@@ -266,6 +281,11 @@ export interface ScreenshotsOpts {
   // 元素识别的 Canny 双阈值，默认 { low: 20, high: 60 }
   // 浅色低对比的界面检不出来就往下调，壁纸噪声太多就往上调；只在 detectEdges 开启时生效
   edgeThresholds?: { low?: number; high?: number };
+  // 抓屏前等多久（毫秒），默认 50：给宿主「隐藏自己窗口」留出合成器时间，
+  // 否则 hide() 之后立刻抓屏会抓到 hide 生效前那一帧 —— 底图上留下宿主的残影。
+  // 只在本轮第一次抓屏前等一次，且与建窗口并行，基本不增加"从点击到画面锁住"的耗时。
+  // 传 0 关闭（宿主自己保证抓屏时窗口已不在画面上）
+  captureSettleMs?: number;
 }
 ```
 

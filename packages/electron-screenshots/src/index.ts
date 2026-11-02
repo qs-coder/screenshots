@@ -27,6 +27,11 @@ import getEdges, {
   type Region,
 } from './getEdges.js';
 import getWindows, { resetWindowCache } from './getWindows.js';
+import {
+  getNodeScreenshotsLoadError,
+  requireNodeScreenshots,
+  warmUpNodeScreenshots,
+} from './loadNodeScreenshots.js';
 import padStart from './padStart.js';
 import type { Bounds, ScreenshotsData } from './preload.js';
 import {
@@ -85,6 +90,19 @@ export interface ScreenshotsOpts {
    * 只在 `detectEdges` 开启时生效。
    */
   edgeThresholds?: { low?: number; high?: number };
+  /**
+   * 抓屏前等多久（毫秒），给宿主"隐藏自己窗口"留出合成器时间，默认 `50`。
+   *
+   * 防截屏模式下宿主都是 `mainWindow.hide()` 之后立刻起截图，而这一抓**可能抓到
+   * hide 生效前的那一帧** —— 底图上就留下宿主的残影（实测：`hide()` 之后 0ms 抓，
+   * 窗口像素仍在画面里；16ms 后剩 0.3% 的边；50ms 后才彻底干净）。
+   *
+   * 只在本轮**第一次**抓屏前等一次，而且这段时间和建窗口（`reset` 等渲染回执）
+   * 是并行的，所以基本不增加"从点击到画面锁住"的耗时。
+   *
+   * 传 0 关闭（宿主自己保证抓屏时窗口已经不在画面上）。
+   */
+  captureSettleMs?: number;
 }
 
 export type { Bounds };
@@ -96,6 +114,24 @@ const windowTypes: Record<string, string | undefined> = {
   linux: undefined,
   win32: 'toolbar',
 };
+
+/**
+ * 兜底抓屏（`desktopCapturer`）里"丢弃第一帧"时，两次取源之间的间隔。
+ *
+ * 太短（<30ms）第二次很可能还是同一帧，等于白取；太长（>200ms）只会拖慢这条
+ * 本来就已经很慢的路。60ms 够新的采集流产出第一帧，肉眼也看不出截图变慢。
+ */
+const FALLBACK_SECOND_GRAB_DELAY = 60;
+
+/**
+ * 抓屏前默认等多久，见 `ScreenshotsOpts.captureSettleMs`。
+ *
+ * 实测（macOS，宿主 `hide()` 之后立刻抓屏，按窗口区域的像素统计）：
+ * `+0ms` 窗口像素仍然整块在画面里（26.0%，和可见时 26.2% 一样）；
+ * `+16ms` 剩 0.3%（只剩边缘那一圈）；`+50ms` 才 0.00%。
+ * 也就是说"截图里那层宿主残影"不是玄学，就是抓早了一帧。
+ */
+const CAPTURE_SETTLE_MS = 50;
 
 /**
  * 当前系统能不能用**透明窗口**当覆盖层。
@@ -159,6 +195,12 @@ export default class Screenshots extends Events {
 
   private edgeThresholds: EdgeThresholds | undefined;
 
+  /** 本轮第一次抓屏前要等的毫秒数，见 `ScreenshotsOpts.captureSettleMs` */
+  private captureSettleMs: number;
+
+  /** 本轮"抓屏前的那一拍"已经等过了（只等第一次，其余屏与换屏补截不必再等） */
+  private settleDone = false;
+
   /**
    * 每次下发截图都自增。元素检测是异步的，靠它判断结果还对不对应当前这张图。
    */
@@ -176,6 +218,14 @@ export default class Screenshots extends Events {
 
   /** 本轮枚举到的系统窗口矩形，只给调试图画框用（识别结果本身走 `SCREENSHOTS:windows`） */
   private captureWindows: Bounds[] = [];
+
+  /**
+   * 本轮截图是否已经警告过"退化到 desktopCapturer"。
+   *
+   * 只在每轮第一次降级时打一条：这条路会连着走（活动屏 + 每块副屏 + 换屏补截），
+   * 每次都打就把日志刷满了。
+   */
+  private fallbackWarned = false;
 
   /**
    * 每块屏幕的截图，key 为 display.id。
@@ -288,6 +338,13 @@ export default class Screenshots extends Events {
     this.isPromptScreenPermission = opts?.promptScreenPermission || false;
     this.isDetectEdges = opts?.detectEdges || false;
     this.edgeThresholds = opts?.edgeThresholds;
+    this.captureSettleMs = opts?.captureSettleMs ?? CAPTURE_SETTLE_MS;
+    /**
+     * 先依赖：原生模块在这里同步加载掉（实测几毫秒），第一次截图不用再等，
+     * 加载失败的原因也能在构造时就落到 `getNodeScreenshotsLoadError()` 里。
+     * 失败不抛 —— 抓屏和窗口识别各自走降级，构造不会被打崩。
+     */
+    warmUpNodeScreenshots();
     this.listenIpc();
     this.$view.webContents.loadURL(
       `file://${require.resolve('@qs-coder/react-screenshots/dist/electron.html')}`,
@@ -465,6 +522,13 @@ export default class Screenshots extends Events {
       return;
     }
     mark('promptScreenPermission');
+
+    /**
+     * 新一轮的两个一次性开关，必须在**发起抓屏之前**清掉：
+     * 抓屏会先等 `captureSettleMs`（给宿主的 hide 留时间），这里晚一行就漏掉了。
+     */
+    this.settleDone = false;
+    this.fallbackWarned = false;
 
     /**
      * 先把屏幕**冻住**，再去等渲染端就绪。
@@ -968,6 +1032,9 @@ export default class Screenshots extends Events {
     // 停止屏幕监听
     this.stopScreenWatcher();
     this.capturing = false;
+    // 下一轮重新计"抓屏前那一拍"与降级警告
+    this.settleDone = false;
+    this.fallbackWarned = false;
     // 22MB 级别的像素缓存，截图结束就放手，别占着宿主的内存
     this.edgeSource = undefined;
     this.captureWindows = [];
@@ -1510,6 +1577,37 @@ export default class Screenshots extends Events {
   }
 
   /**
+   * 抓屏前等一拍，把"宿主刚 hide 掉自己窗口"这件事让合成器做完。
+   *
+   * 防截屏模式下宿主的调用顺序永远是 `mainWindow.hide()` → `startCapture()`，
+   * 中间只有几个微任务；而抓屏拿到的是**调用那一刻屏幕上的合成结果**，
+   * `hide()` 还没被 WindowServer 处理完，于是宿主窗口原封不动地进了底图 ——
+   * 用户看到的就是"截图里有一层自己应用的虚影/残影"。
+   *
+   * 实测（见 `CAPTURE_SETTLE_MS`）：0ms 抓 → 窗口整块还在；16ms → 只剩边缘；
+   * 50ms → 彻底干净。所以这里等 50ms，而且**只等本轮第一次**：
+   * 后面那些抓屏（其他屏预截、换屏补截）发生时窗口早就没了。
+   *
+   * 这段等待和 `createWindow`（`reset` 要等渲染端回执，实测几十到几百毫秒）并行，
+   * 所以"从点击到画面锁住"的耗时基本不变。
+   */
+  private async settleBeforeGrab(): Promise<void> {
+    if (this.settleDone || this.captureSettleMs <= 0) {
+      return;
+    }
+    this.settleDone = true;
+    const startedAt = performance.now();
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, this.captureSettleMs);
+    });
+    this.logger(
+      '抓屏前等待 %dms（给宿主 hide 留合成时间，实际 %dms）',
+      this.captureSettleMs,
+      Math.round(performance.now() - startedAt),
+    );
+  }
+
+  /**
    * 截一块屏。
    *
    * `onGrabbed` 在**像素已经抓到手**、还没开始编码的那一刻回调。
@@ -1530,10 +1628,15 @@ export default class Screenshots extends Events {
       onGrabbed?.();
     };
 
+    await this.settleBeforeGrab();
+
     try {
       let time = performance.now();
-      const { Monitor } = await import('node-screenshots');
-      const importCost = Math.round(performance.now() - time);
+      // 必须走 CJS require（见 loadNodeScreenshots）：asar 里动态 import 会 ENOTDIR，
+      // 一失败就退到下面的 desktopCapturer 兜底，而那条路的第一帧可能是旧帧。
+      // 模块在构造时就预热过，这里通常只是一次同步取缓存
+      const { Monitor } = requireNodeScreenshots();
+      const loadCost = Math.round(performance.now() - time);
       time = performance.now();
 
       let point = {
@@ -1578,8 +1681,8 @@ export default class Screenshots extends Events {
       const pngCost = Math.round(performance.now() - time);
 
       this.logger(
-        'SCREENSHOTS:capture 耗时 import %dms fromPoint %dms captureImage %dms toPng %dms png %dKB',
-        importCost,
+        'SCREENSHOTS:capture 耗时 load %dms fromPoint %dms captureImage %dms toPng %dms png %dKB',
+        loadCost,
         fromPointCost,
         imageCost,
         pngCost,
@@ -1589,13 +1692,7 @@ export default class Screenshots extends Events {
     } catch (err) {
       this.logger('SCREENSHOTS:capture Monitor capture() error %o', err);
       const time = performance.now();
-      const sources = await desktopCapturer.getSources({
-        types: ['screen'],
-        thumbnailSize: {
-          width: Math.floor(display.width * display.scaleFactor),
-          height: Math.floor(display.height * display.scaleFactor),
-        },
-      });
+      const sources = await this.fallbackSources(display);
       this.logger(
         'SCREENSHOTS:capture 耗时 desktopCapturer.getSources %dms',
         Math.round(performance.now() - time),
@@ -1668,6 +1765,66 @@ export default class Screenshots extends Events {
       // 兜底路径拿不到 RGBA，元素检测只能跳过
       return { png: source.thumbnail.toPNG() };
     }
+  }
+
+  /**
+   * 兜底抓屏用的屏幕源（`desktopCapturer`）。
+   *
+   * 只在 `node-screenshots` 用不了时才走到这里：asar 里解析失败、原生模块没装、
+   * 采集调用抛错。这条路有两个坑，都在这儿挡掉：
+   *
+   * 1. **第一帧可能是旧帧** —— 这就是"截图里有一层宿主窗口残影"的现场。
+   *    `desktopCapturer.getSources` 在 macOS 上是"新建一条采集流、取第一帧"，
+   *    而这一帧可能来自 WindowServer 里**更早**的合成结果：宿主刚 `hide()` /
+   *    最小化的那个窗口还留在里面（半透明、位置尺寸都可能不是当下的）。
+   *    所以这里取两次源、**只用第二次**的缩略图 —— 第二帧一定是这条流开始之后画的。
+   *    代价是多花一次 `getSources`（几百毫秒），但这条路本来就不是快路径，
+   *    宁可慢也不能把残影冻进截图。
+   * 2. **静默降级** —— 同一个模块挂了，窗口枚举（`Window.all()`）必然也是空列表，
+   *    用户只会看到"没有高亮 + 有残影"，根本分不清是权限、依赖还是解析问题。
+   *    所以每轮截图第一次走到这里都打一条明确的警告。
+   */
+  private async fallbackSources(
+    display: Display,
+  ): Promise<DesktopCapturerSource[]> {
+    if (!this.fallbackWarned) {
+      this.fallbackWarned = true;
+      const reason = getNodeScreenshotsLoadError();
+      this.logger(
+        '抓屏退化到 desktopCapturer：画面可能带宿主刚隐藏窗口的残影，窗口识别同时不可用%s',
+        reason ? `（${reason.message}）` : '',
+      );
+    }
+
+    const thumbnailSize = {
+      width: Math.floor(display.width * display.scaleFactor),
+      height: Math.floor(display.height * display.scaleFactor),
+    };
+    const first = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize,
+    });
+    // 等一拍再取第二次：新建采集流要一点时间才会产出"当下"的帧，
+    // 立刻重取大概率还是同一帧（等于没换）
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, FALLBACK_SECOND_GRAB_DELAY);
+    });
+    try {
+      const second = await desktopCapturer.getSources({
+        types: ['screen'],
+        thumbnailSize,
+      });
+      if (second.length) {
+        this.logger(
+          'SCREENSHOTS:capture 兜底取源两次，丢弃第一帧（%d 个源）',
+          second.length,
+        );
+        return second;
+      }
+    } catch (err) {
+      this.logger('SCREENSHOTS:capture 兜底第二次取源失败，退回第一帧 %o', err);
+    }
+    return first;
   }
 
   /**

@@ -1,6 +1,7 @@
 import process from 'node:process';
 import type { Display } from './getDisplay.js';
 import getMonitor from './getMonitor.js';
+import { requireNodeScreenshots } from './loadNodeScreenshots.js';
 import type { Bounds } from './preload.js';
 
 /**
@@ -120,7 +121,7 @@ export default async function getWindows(
   const visible: Bounds[] = [];
 
   try {
-    const monitor = await getMonitor(display);
+    const monitor = getMonitor(display);
 
     // `Window.all()` 和 `Monitor` 是同一套坐标，Electron 的 `display` 是 DIP；
     // Windows 开显示缩放时两者差一个 scaleFactor（物理像素 / DIP），
@@ -336,7 +337,10 @@ async function enumerate(
   const result: RawWindow[] = [];
 
   try {
-    const { Window } = await import('node-screenshots');
+    // 必须走 CJS require：asar 里 `import('node-screenshots')` 会 ENOTDIR，
+    // 于是这里静默变成空列表 —— 表现就是"窗口识别完全没生效"，见 loadNodeScreenshots。
+    // 拿不到模块会抛，由下面的 catch 收敛成空列表
+    const { Window } = requireNodeScreenshots();
 
     // 原生顺序就是 z 从大到小，渲染端从上往下找第一个命中的窗口即视觉上最上面的那个
     const windows = Window.all();
