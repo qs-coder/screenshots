@@ -18,6 +18,7 @@ import fs from 'fs-extra';
 import type { Image as ShotImage } from 'node-screenshots';
 import { isEdgesDebugEnabled, writeEdgesDebugImage } from './edgesDebug.js';
 import Event from './event.js';
+import { FREEZE_HTML } from './freeze.js';
 import getDisplay, { type Display, toDisplay } from './getDisplay.js';
 import getEdges, {
   type EdgeThresholds,
@@ -96,11 +97,14 @@ const windowTypes: Record<string, string | undefined> = {
   win32: 'toolbar',
 };
 
-// 屏蔽窗口只需要一个 not-allowed 光标，画面本体由窗口的半透明黑底提供
-const BLOCK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>html,body{position:fixed;top:0;right:0;bottom:0;left:0;margin:0;overflow:hidden;cursor:not-allowed}</style></head><body></body></html>`;
-
-/** 屏蔽窗口压暗到多黑。注意它是**会被截进图里**的，所以截图必须发生在它出现之前 */
-const BLOCK_OPACITY = 0.5;
+/**
+ * 多屏截图的两条硬约束（改这里之前先看 `freeze.ts` 与 `switchDisplay`）：
+ *
+ * 1. 每块屏上常驻一个「冻结画面」窗口：这张屏自己的截图 + 与活动屏同 alpha 的压暗。
+ *    所有屏幕因此长得一模一样，光标划过去只有高亮在变，亮度不会跳。
+ * 2. 换屏时交互窗口整层隐身（`setBlank`），换图 / 搬窗口 / 改尺寸都在看不见的时候做完。
+ *    能这么干的前提就是第 1 条 —— 隐身之后露出来的还是同一张画面。
+ */
 
 export default class Screenshots extends Events {
   // 截图窗口对象
@@ -183,8 +187,35 @@ export default class Screenshots extends Events {
   /** ESC 全局快捷键是否由本库持有（见 `registerEscShortcut`） */
   private escRegistered = false;
 
-  /** 非活动屏幕上的屏蔽窗口，key 为 display.id */
-  private $blockWins = new Map<number, BrowserWindow>();
+  /**
+   * 每块屏的「冻结画面」窗口，key 为 display.id。
+   *
+   * 它不是遮罩，而是**这块屏自己的那张截图**（外加和活动屏同 alpha 的压暗）。
+   * 于是整场截图里每块屏看起来都一样：一张定格的画面，均匀压暗 30%。
+   *
+   * 这一点是"换屏视觉平稳"的地基：
+   * - 换屏时交互窗口整层隐身（`setBlank`），露出来的还是同一张画面、同一层压暗，
+   *   用户看不到任何变化，换图/搬窗口/改尺寸都藏在后面做完；
+   * - 非活动屏不再是"50% 纯黑盖在真实桌面上"，而是和活动屏亮度一致，
+   *   光标划过去不会出现"这块屏突然亮一点、那块暗一点"；
+   * - 真实桌面在压暗之后就不再露出来了，换屏中途也不会"解冻"一下再冻回去。
+   *
+   * 窗口本身常驻（整场只建一次），只在结束截图时销毁。
+   */
+  private $freezeWins = new Map<
+    number,
+    {
+      $win: BrowserWindow;
+      /** 页面加载完了没有：加载前的 IPC 会丢，所以图片和压暗都要先暂存 */
+      loaded: boolean;
+      /** 显示过没有。没显示过的窗口拍不进预截，也不会被算作"可以隐身" */
+      shown: boolean;
+      /** 这块屏的截图，等页面加载完补发 */
+      png: Buffer | undefined;
+      /** 压暗层该不该亮着（同样要能补发） */
+      veil: boolean;
+    }
+  >();
 
   private isReady = new Promise<void>((resolve) => {
     ipcMain.once('SCREENSHOTS:ready', () => {
@@ -204,11 +235,19 @@ export default class Screenshots extends Events {
      * sendWindows/detectEdges 里 seq !== captureSeq 被丢掉，渲染端拿不到 windows/edges。
      */
     lock: boolean;
+    /**
+     * 立刻查一次（不等定时器那一拍）。
+     *
+     * 光标一进到别的屏就调它：靠 100ms 轮询的话，这段时间光标还停在冻结画面上，
+     * 显示的是 not-allowed，换过去才变回十字 —— 来回划屏就是"箭头闪一下"。
+     */
+    nudge: (() => void) | null;
   } = {
     currentDisplay: null as unknown as Display,
     timer: null,
     watching: false,
     lock: false,
+    nudge: null,
   };
 
   constructor(opts?: ScreenshotsOpts) {
@@ -438,22 +477,29 @@ export default class Screenshots extends Events {
     });
 
     /**
-     * 屏蔽窗口先立起来（全透明，照样挡点击，但不会被拍进图里）。
+     * 冻结画面先立起来：每块屏一张"自己的截图 + 30% 压暗"。
      *
      * 必须排在截图窗口 show 之前：遮罩要"跟着截图一起出来"。
-     * 等绘制完再建就晚了几百毫秒，用户看到的是另一块屏先敞着、过一会儿才压暗。
+     * 等绘制完再建就晚了几百毫秒，用户看到的是另一块屏先敞着、过一会儿才暗下去。
+     *
+     * 活动屏的截图此刻已经在手上（`shotPromise` 刚 resolve），压暗和画面直接给它；
+     * 其他屏要等自己那块抓完，见 `captureOtherDisplays`。
      */
-    this.ensureBlockWindows();
+    this.ensureFreezeWindows();
+    this.setFreezeVeil(display.id, true);
+    this.pushFreezeImage(display.id, shot.png);
 
     /**
      * 先以**全透明**显示，等渲染端把这一帧画完再亮出来。
      *
      * 不能"等画完再 show"：隐藏窗口里 rAF 不跑、解码也慢得离谱（实测首次解码要 1 秒以上，
      * 而且经常等不到），主进程只能等到超时，截图窗口反而更晚出现。
-     * 也不能"先 show 再等图"：窗口先出现但里面什么都没有，透明窗口直接把桌面透出来，
-     * 等图到了再"啪"地换上去 —— 开局这一下闪烁就是这么来的。
+     * 也不能"先 show 再等图"：窗口先出现但里面什么都没画完，等图到了再"啪"地换上去。
      * 所以取中间：显示（这样渲染进程才会正常出帧）但完全透明（用户看不见），
      * 画好了再亮出来，用户看到的第一帧就是完整的截图。
+     *
+     * 亮出来的这一刻是**看不出变化**的：底下那张冻结画面早就是同一张图、同一层压暗，
+     * 换上来只是"同一画面换了个更靠前的窗口在画"。
      */
     $win.setOpacity(0);
     $win.show();
@@ -502,10 +548,12 @@ export default class Screenshots extends Events {
    * 预截其他屏幕。
    *
    * 并行截、并行编码，耗时约等于最慢的那一块屏，不阻塞截图窗口显示。
-   * **每块屏的像素一抓到手就立刻压暗自己的遮罩**（不等 PNG 编码）——
-   * 编码一块 5K 屏要几百毫秒，等编码完再压暗，几块屏会一块一块地黑下去，
+   * **每块屏的像素一抓到手就立刻压暗自己的冻结画面**（不等 PNG 编码）——
+   * 编码一块 5K 屏要几百毫秒，等编码完再压暗，几块屏会一块一块地暗下去，
    * 用户看到的就是"遮罩没同步出来"。
-   * 失败只丢这一块屏的缓存（换屏时再补截），不能让整次截图失败。
+   * 编码完再把截图交给这个窗口：压暗已经在了，换成"压暗后的截图"是同一次变更，
+   * 亮度不变、内容就是抓那一刻的屏幕，看不出来。
+   * 失败只丢这一块屏的画面（换屏时再补截），不能让整次截图失败。
    */
   private async captureOtherDisplays(active: Display): Promise<void> {
     const others = screen
@@ -517,14 +565,9 @@ export default class Screenshots extends Events {
         others.map(async (item) => {
           const display = toDisplay(item);
           try {
-            /**
-             * 抓完像素就压暗（不等编码），这块屏的遮罩几乎是立刻出来的。
-             * 遮罩必须赶在编码之前：编码一块 5K 屏要几百毫秒，
-             * 等编码完再压暗，几块屏就会一块一块地黑下去，看着像"遮罩没同步"。
-             */
             const shot = await this.capture(display, () => {
               if (this.capturing) {
-                this.setBlockDim(display.id, true);
+                this.setFreezeVeil(display.id, true);
               }
             });
             // 期间截图可能已经结束，缓存留着没用还占内存
@@ -536,6 +579,7 @@ export default class Screenshots extends Events {
               png: shot.png,
               image: shot.image,
             });
+            this.pushFreezeImage(display.id, shot.png);
             this.logger(
               '预截屏幕 %d 完成 %dKB',
               display.id,
@@ -547,16 +591,16 @@ export default class Screenshots extends Events {
         }),
       );
     } finally {
-      // 不管截成没截成，遮罩都得亮起来，否则其他屏幕一直不压暗
-      this.revealBlockWindows(active);
+      // 不管截成没截成，压暗都得亮起来，否则那块屏一直敞着、还能点到底下的应用
+      this.revealFreezeVeils();
     }
   }
 
   /**
    * 取某块屏幕的截图：优先用预截缓存，没有才现场截。
    *
-   * 现场截之前必须先把这块屏的屏蔽窗口隐掉，不然拍到的就是那层半透明黑。
-   * 只有"截图过程中新插进来的屏幕"会走到这条路径。
+   * 现场截之前必须先把这块屏的冻结画面收起来，不然拍到的就是"上一张截图 + 压暗"——
+   * 这也正是为什么换屏一律取缓存。只有"截图过程中新插进来的屏幕"会走到这条路径。
    */
   private async shotOf(
     display: Display,
@@ -566,26 +610,31 @@ export default class Screenshots extends Events {
       return cached;
     }
 
-    const $block = this.$blockWins.get(display.id);
-    const needHide = !!$block && !$block.isDestroyed();
-    // 还原成"截之前什么样"：可能是压暗的，也可能是活动屏的全透明
-    const prevOpacity = needHide ? $block.getOpacity() : 0;
-    if (needHide) {
-      $block.setOpacity(0);
+    const item = this.$freezeWins.get(display.id);
+    const needHide = !!item && item.shown && !item.$win.isDestroyed();
+    if (needHide && item) {
+      item.$win.hide();
     }
+    let shot: { png: Buffer; image?: ShotImage | undefined };
     try {
-      const shot = await this.capture(display);
-      this.shots.set(display.id, {
-        display,
-        png: shot.png,
-        image: shot.image,
-      });
-      return shot;
+      shot = await this.capture(display);
     } finally {
-      if (needHide && !$block.isDestroyed()) {
-        $block.setOpacity(prevOpacity);
+      // 先让窗口回来再推图：隐藏窗口里的解码会被拖住
+      if (needHide && item && !item.$win.isDestroyed()) {
+        item.$win.show();
+        this.raiseInteractive(item.$win);
       }
     }
+
+    this.shots.set(display.id, {
+      display,
+      png: shot.png,
+      image: shot.image,
+    });
+    // 新插进来的屏：压暗 + 画面都得补上，否则换过去是一片真实桌面
+    this.setFreezeVeil(display.id, true);
+    this.pushFreezeImage(display.id, shot.png);
+    return shot;
   }
 
   /**
@@ -645,6 +694,11 @@ export default class Screenshots extends Events {
     this.screenWatcher.watching = true;
 
     const checkScreen = async () => {
+      // 同一时刻只留一条链：nudge 会插进来，不先清掉定时器就会跑出两条并行链
+      if (this.screenWatcher.timer) {
+        clearTimeout(this.screenWatcher.timer);
+        this.screenWatcher.timer = null;
+      }
       if (
         !this.screenWatcher.watching ||
         !this.$win ||
@@ -683,23 +737,28 @@ export default class Screenshots extends Events {
       this.screenWatcher.timer = setTimeout(checkScreen, 100);
     };
 
+    this.screenWatcher.nudge = () => {
+      void checkScreen();
+    };
     checkScreen();
   }
 
   /**
    * 光标换到另一块屏。
    *
-   * 顺序是这次修复的核心，目标是**每一步都发生在"用户看不见"的时候**：
+   * 目标只有一个：**用户看不到任何变化**。换屏要做的三件事（换底图、搬窗口、改尺寸）
+   * 每一件单独拿出来都会露出中间态，所以整段都放在"看不见的时候"做：
    *
-   * 1. 新图先画好 —— 此刻窗口还在旧屏，替换过程被旧屏挡着；
-   * 2. **旧屏先压暗** —— 此刻旧屏还被截图窗口盖着，这一步也看不见。
-   *    等窗口搬走时，露出来的是"已经变暗的桌面"，而不是真实桌面过一会儿再补一层黑；
-   * 3. 搬窗口 —— 新屏的遮罩还亮着，但它在截图窗口**下面**，所以看不到；
-   * 4. **新屏再撤遮罩** —— 窗口已经盖满了，这一步同样看不见。
+   * 1. 交互窗口整层隐身（`setBlank`）—— 此刻两块屏上露出来的都是各自的冻结画面
+   *    （同一张截图 + 同一层 30% 压暗），和隐身前一模一样；
+   * 2. 新底图在隐身期间提交并画好（旧屏上不会闪出另一块屏的画面）；
+   * 3. 搬窗口 + 改尺寸也在隐身期间完成（跨屏、跨缩放比的合成器重建看不见）；
+   * 4. 新画面已经上屏，再取消隐身 —— 用户看到的第一帧就是新屏的画面。
    *
-   * 反过来的顺序（先搬窗口再压暗旧屏）就会露出真实桌面，这就是来回换屏的闪烁来源。
+   * 没有冻结画面兜底时（Linux、或截图过程中新插进来还没截过的屏）退回原来的直接搬：
+   * 那时隐身只会露出真实桌面，反而更闪。
    *
-   * 截图一律取 `shotOf` 的缓存：目标屏此刻盖着屏蔽窗口，重新截屏会把那层半透明黑拍进去。
+   * 截图一律取 `shotOf` 的缓存：目标屏此刻盖着冻结画面，重新截屏会把那层压暗拍进去。
    */
   private async switchDisplay(
     display: Display,
@@ -711,8 +770,8 @@ export default class Screenshots extends Events {
     }
 
     const startedAt = performance.now();
-    // 中途插拔屏幕时补齐屏蔽窗口（正常情况下这里什么都不做）
-    this.ensureBlockWindows();
+    // 中途插拔屏幕时补齐冻结画面（正常情况下这里什么都不做）
+    this.ensureFreezeWindows();
     const shot = await this.shotOf(display);
     // 换屏不算"新的一轮截图"：`captureSeq` 只在 startCapture 里递增。
     // 以前这里也 ++，而开场识别要一两秒才跑完 —— 用户在识别算完之前把光标划到
@@ -720,38 +779,69 @@ export default class Screenshots extends Events {
     // 看起来就是"窗口边缘完全识别不出来"。识别结果该不该下发，改由屏 id 判断。
     const seq = this.captureSeq;
 
-    // 1. 渲染端换图并画好这一帧（此时窗口还在旧屏上，用户看不到这次替换）
-    await this.prepareRenderer(display, shot.png);
+    // 两块屏都有冻结画面才敢隐身，否则露出来的就是真实桌面
+    const masked =
+      this.freezeReady(display.id) && this.freezeReady(previous.id);
+    if (masked) {
+      this.setBlank(true);
+    }
+    try {
+      // 1. 渲染端换图并画好这一帧（整段都在隐身中）
+      await this.prepareRenderer(display, shot.png);
 
-    // 2. 旧屏先压暗（被截图窗口盖着，看不见）
-    this.setBlockDim(previous.id, true);
-
-    // 3. 内容已经就绪，窗口搬过去的第一帧就是新屏的画面
-    if (!$win.isDestroyed()) {
-      $win.setBounds(display);
-      this.$view.setBounds({
-        x: 0,
-        y: 0,
-        width: display.width,
-        height: display.height,
-      });
-      this.assertTopMost($win);
-      $win.moveTop();
+      // 2. 内容已经就绪，窗口搬过去的第一帧就是新屏的画面
+      if (!$win.isDestroyed()) {
+        $win.setBounds(display);
+        this.$view.setBounds({
+          x: 0,
+          y: 0,
+          width: display.width,
+          height: display.height,
+        });
+        this.assertTopMost($win);
+        $win.moveTop();
+      }
+      if (masked) {
+        /**
+         * 让窗口的"搬家"先落到合成器上再取消隐身。
+         *
+         * 两者都是异步的：取消隐身要走 渲染端绘制 → 合成 → 上屏，通常比 setBounds
+         * 慢一两帧，但跨屏（尤其跨缩放比）时并不保证。差一帧就是"新屏的画面
+         * 在旧屏上闪一下"，代价只有十几毫秒，索性等一拍。
+         */
+        await new Promise<void>((resolve) => setTimeout(resolve, 16));
+      }
+    } finally {
+      if (masked) {
+        this.setBlank(false);
+      }
     }
 
-    // 4. 新屏撤遮罩（已经被截图窗口盖满，看不见）
-    this.setBlockDim(display.id, false);
-
     this.logger(
-      '换屏 → %d %dx%d 耗时 %dms',
+      '换屏 → %d %dx%d 耗时 %dms%s',
       display.id,
       display.width,
       display.height,
       Math.round(performance.now() - startedAt),
+      masked ? '（隐身切换）' : '',
     );
 
     // 换屏后只下发开场就算好的结果，1ms 量级；这里绝不能再跑识别
     this.sendRecognition(display, seq);
+  }
+
+  /**
+   * 让交互窗口整层隐身 / 恢复。
+   *
+   * 用渲染端的 `visibility: hidden` 而不是 `win.setOpacity`：窗口本来就是透明的，
+   * 藏掉内容就等于藏掉窗口，而 `setOpacity` 在部分平台/透明窗口上并不可靠。
+   * 隐身期间窗口仍在最前面、仍然挡点击，只是画不出东西来。
+   */
+  private setBlank(blank: boolean): void {
+    if (!this.$view || this.$view.webContents.isDestroyed()) {
+      return;
+    }
+    this.$view.webContents.send('SCREENSHOTS:blank', blank);
   }
 
   private stopScreenWatcher() {
@@ -760,6 +850,7 @@ export default class Screenshots extends Events {
       this.screenWatcher.timer = null;
     }
     this.screenWatcher.watching = false;
+    this.screenWatcher.nudge = null;
     // 结束截图时强制释放锁：万一 capture 还在跑，下一次截图不能被上一轮卡住
     this.screenWatcher.lock = false;
   }
@@ -856,7 +947,7 @@ export default class Screenshots extends Events {
     this.edgePixels.clear();
     this.decodedInRenderer.clear();
     this.paintWaiter = null;
-    this.destroyBlockWindows();
+    this.destroyFreezeWindows();
     await this.reset();
 
     if (!this.$win) {
@@ -973,9 +1064,9 @@ export default class Screenshots extends Events {
       this.$win.on('closed', () => {
         this.emit('windowClosed', this.$win);
         this.$win = null;
-        // 屏蔽窗口不可聚焦、也不在任务栏，宿主直接 close 截图窗口时必须一起收掉，
-        // 否则会留下一层用户点不掉的黑色遮罩
-        this.destroyBlockWindows();
+        // 冻结画面不可聚焦、也不在任务栏，宿主直接 close 截图窗口时必须一起收掉，
+        // 否则会留下一层用户点不掉的压暗遮罩
+        this.destroyFreezeWindows();
       });
 
       /**
@@ -1062,16 +1153,16 @@ export default class Screenshots extends Events {
   }
 
   /**
-   * 把截图窗口和所有遮罩一起抬回最上层，**截图窗口必须在最后**。
+   * 把截图窗口和所有冻结画面一起抬回最上层，**截图窗口必须在最后**。
    *
-   * 顺序不能反：遮罩和截图窗口同在 `screen-saver` 层级，谁后抬谁在上面。
-   * 遮罩一旦压住活动屏的截图窗口，macOS 会把截图窗口判成 occluded，
+   * 顺序不能反：冻结画面和截图窗口同在 `screen-saver` 层级，谁后抬谁在上面。
+   * 冻结画面一旦压住活动屏的截图窗口，macOS 会把截图窗口判成 occluded，
    * 渲染端被节流（rAF 停、定时器拖到 1s），换屏就开始"追不上光标"。
    */
   private raiseAll(): void {
-    for (const $block of this.$blockWins.values()) {
-      if (!$block.isDestroyed()) {
-        $block.setAlwaysOnTop(true, 'screen-saver');
+    for (const item of this.$freezeWins.values()) {
+      if (!item.$win.isDestroyed()) {
+        item.$win.setAlwaysOnTop(true, 'screen-saver');
       }
     }
     this.assertTopMost(this.$win);
@@ -1114,16 +1205,19 @@ export default class Screenshots extends Events {
   }
 
   /**
-   * 为**每一块**屏幕建一个常驻的屏蔽窗口（先全透明）。
+   * 为**每一块**屏幕建一个常驻的「冻结画面」窗口。
    *
    * 早先是"活动屏不留、其余屏建"，于是每换一次屏都要销毁一个、重建一个 ——
    * 重建要走 `new BrowserWindow` + `loadURL` + `show`，实测 80~150ms。
    * 这段空窗期里刚离开的那块屏会露出**真实桌面**，然后才被半透明黑盖上：
-   * 来回切换就是"亮一下、黑一下"的闪烁，看起来像遮罩在闪。
+   * 来回切换就是"亮一下、黑一下"的闪烁。
    *
-   * 现在一次建全，整场只切 opacity —— 换屏不再创建/销毁任何窗口，没有空窗期。
+   * 现在一次建全、整场只推两个状态（压暗、截图），换屏不再创建/销毁任何窗口。
+   *
+   * 建出来先**不显示**：预截其他屏幕时它不能被拍进去，透明窗口在 Windows 上
+   * 首帧也可能闪一下黑。等这块屏的像素抓到、要压暗了再 show（见 `setFreezeVeil`）。
    */
-  private ensureBlockWindows(): void {
+  private ensureFreezeWindows(): void {
     if (process.platform === 'linux') {
       return;
     }
@@ -1133,13 +1227,13 @@ export default class Screenshots extends Events {
 
     for (const display of screen.getAllDisplays()) {
       alive.add(display.id);
-      if (this.$blockWins.has(display.id)) {
+      if (this.$freezeWins.has(display.id)) {
         continue;
       }
       created = true;
 
       const $win = new BrowserWindow({
-        title: 'screenshots-blocker',
+        title: 'screenshots-freeze',
         x: Math.floor(display.bounds.x),
         y: Math.floor(display.bounds.y),
         width: Math.floor(display.bounds.width),
@@ -1148,7 +1242,8 @@ export default class Screenshots extends Events {
         type: windowTypes[process.platform] as string,
         frame: false,
         show: false,
-        transparent: false,
+        // 页面本体就是截图 + 压暗，窗口底色必须透明，压暗层才压得住真实桌面
+        transparent: true,
         /**
          * 必须可聚焦：focusable: false 的窗口在 macOS 上不会把鼠标事件交给渲染进程，
          * 光标样式因此一直是默认箭头。被点到就立刻把焦点还给截图窗口即可。
@@ -1160,24 +1255,51 @@ export default class Screenshots extends Events {
         maximizable: false,
         skipTaskbar: true,
         alwaysOnTop: true,
+        /**
+         * **必须盖住菜单栏**，和截图窗口用同一套办法（kiosk）。
+         *
+         * macOS 会把普通窗口的 frame 约束进"可见区域"（去掉菜单栏那 30 多个点），
+         * 于是窗口整体下移、页面里的截图跟着错位：屏幕顶部露出真实的菜单栏，
+         * 紧接着又是冻结画面里自带的那条 —— 看上去就是"顶上有两个任务栏"。
+         * 老的纯黑遮罩同样被约束过，只是黑色错位看不出来；换成截图就藏不住了。
+         *
+         * 只在 macOS 上开：Windows / Linux 没有这个约束，而那边的 kiosk 是
+         * "独占全屏到某块屏"，会把这里按 display 排好的 bounds 顶掉。
+         */
+        kiosk: process.platform === 'darwin',
         fullscreen: false,
+        // mac fullscreenable 设置为 true 会导致应用崩溃（与截图窗口同因）
         fullscreenable: false,
-        backgroundColor: '#000000',
-        // 建出来一律全透明：预截其他屏幕时不能被拍进去
-        opacity: 0,
+        backgroundColor: '#00000000',
+        titleBarStyle: 'hidden',
+        roundedCorners: false,
         hasShadow: false,
+        webPreferences: {
+          preload: require.resolve('./freezePreload.js'),
+          nodeIntegration: false,
+          contextIsolation: true,
+          // 这个窗口整场都在等主进程推图，被判定"后台"也不能把定时器拖慢
+          backgroundThrottling: false,
+        },
       });
 
-      this.$blockWins.set(display.id, $win);
+      const item = {
+        $win,
+        loaded: false,
+        shown: false,
+        png: undefined as Buffer | undefined,
+        veil: false,
+      };
+      this.$freezeWins.set(display.id, item);
       $win.on('closed', () => {
-        this.$blockWins.delete(display.id);
+        this.$freezeWins.delete(display.id);
       });
 
-      // 遮罩也要压在最上面：默认 floating 层级压不住那些常驻浮层，
-      // 一旦被别的窗口盖住，用户就能点到底下的应用
+      // 冻结画面也要压在最上面：默认 floating 层级压不住那些常驻浮层，
+      // 一旦被别的窗口盖住，用户就能看到真实桌面、也能点到底下的应用
       $win.setAlwaysOnTop(true, 'screen-saver');
 
-      // 屏蔽窗口必须可聚焦光标才会更新，所以它一拿到焦点就立刻还给截图窗口
+      // 它必须可聚焦光标才会更新，所以一拿到焦点就立刻还给截图窗口
       $win.on('focus', () => {
         if (this.capturing) {
           this.$win?.focus();
@@ -1185,91 +1307,141 @@ export default class Screenshots extends Events {
       });
 
       $win.loadURL(
-        `data:text/html;charset=utf-8,${encodeURIComponent(BLOCK_HTML)}`,
+        `data:text/html;charset=utf-8,${encodeURIComponent(FREEZE_HTML)}`,
       );
-      // 立刻显示：opacity 是 0，用户看不见，但点击已经挡住了、压暗也是瞬间生效，
-      // 不用等页面加载完（那又是几十毫秒）
-      $win.show();
 
       $win.webContents.on('did-finish-load', () => {
         if ($win.isDestroyed()) {
           return;
         }
+        item.loaded = true;
         this.assertTopMost($win);
-        /**
-         * show() 会把屏蔽窗口抬到最上面，连**同一块屏**上的截图窗口一起压住。
-         *
-         * 后果不只是层级不对：macOS 会把被完全遮住的窗口判成 occluded，
-         * Chromium 于是把渲染端当后台页面节流 —— `document.visibilityState` 变成 hidden，
-         * rAF 不跑、定时器拖到 1s，换屏时的绘制回执就迟迟不到，
-         * 表现就是"窗口追不上光标、来回划屏一路闪"。
-         *
-         * 所以 show 完必须把截图窗口重新抬回去。
-         */
-        if (this.$win && !this.$win.isDestroyed()) {
-          this.assertTopMost(this.$win);
-          this.$win.moveTop();
+        this.raiseInteractive($win);
+        // 页面加载前推的状态会丢，这里补一次；顺序固定：先压暗，再上图
+        this.setFreezeVeil(display.id, item.veil);
+        if (item.png) {
+          $win.webContents.send('SCREENSHOTS:freeze-image', item.png);
         }
       });
     }
 
     // 拔掉的屏幕：销毁它那块，别留着挡一块不存在的区域
-    for (const [id, $win] of this.$blockWins) {
+    for (const [id, item] of this.$freezeWins) {
       if (!alive.has(id)) {
-        this.$blockWins.delete(id);
-        if (!$win.isDestroyed()) {
-          $win.destroy();
+        this.$freezeWins.delete(id);
+        if (!item.$win.isDestroyed()) {
+          item.$win.destroy();
         }
       }
     }
 
-    /**
-     * 屏蔽窗口是后建的，会压在截图窗口之上。截图窗口必须重新抬到最上面，
-     * 否则换屏时"先压暗旧屏"那一步会真的把旧屏画面压暗一瞬间才搬走。
-     */
-    if (created && this.$win && !this.$win.isDestroyed()) {
+    // 新窗口是后建的，会压在截图窗口之上，必须重新抬回去
+    if (created) {
+      this.raiseInteractive();
+    }
+  }
+
+  /**
+   * 把截图窗口重新抬到所有冻结画面之上。
+   *
+   * 反过来（冻结画面压住截图窗口）后果不只是层级不对：macOS 会把被完全遮住的窗口
+   * 判成 occluded，Chromium 于是把渲染端当后台页面节流 —— `document.visibilityState`
+   * 变成 hidden，rAF 不跑、定时器拖到 1s，换屏时的绘制回执就迟迟不到，
+   * 表现就是"窗口追不上光标、来回划屏一路闪"。
+   */
+  private raiseInteractive($freeze?: BrowserWindow | null): void {
+    if ($freeze && !$freeze.isDestroyed()) {
+      this.assertTopMost($freeze);
+    }
+    if (this.$win && !this.$win.isDestroyed()) {
       this.assertTopMost(this.$win);
       this.$win.moveTop();
     }
   }
 
   /**
-   * 压暗 / 恢复某一块屏的遮罩。
+   * 打开/关掉某块屏的压暗层（第一次打开时顺带把窗口显示出来）。
    *
-   * 只改 opacity，窗口一直活着 —— 这是换屏不闪的前提。
-   * 活动屏的遮罩置为全透明并放行鼠标：它可能压在截图窗口之上，不放行就会吃掉点击。
+   * 只动页面里的一个类，窗口本身常驻 —— 换屏路径上不再有窗口的创建销毁。
+   *
+   * 显示用 `show()` 而不是 `setOpacity`：透明窗口在 Windows 上对 setOpacity
+   * 支持不可靠，一旦没生效就是"整块屏永远不压暗"。
    */
-  private setBlockDim(displayId: number, dimmed: boolean): void {
-    const $win = this.$blockWins.get(displayId);
-    if (!$win || $win.isDestroyed()) {
+  private setFreezeVeil(displayId: number, on: boolean): void {
+    const item = this.$freezeWins.get(displayId);
+    if (!item || item.$win.isDestroyed()) {
       return;
     }
-    $win.setIgnoreMouseEvents(!dimmed);
-    $win.setOpacity(dimmed ? BLOCK_OPACITY : 0);
+    item.veil = on;
+    if (on && !item.shown) {
+      item.shown = true;
+      item.$win.show();
+      /**
+       * show 之后再补一次 kiosk：构造时窗口还没上屏，那一次的 frame 调整会落在
+       * "可见区域"里（被菜单栏挡掉 30 多个点）。和截图窗口的 `show` 回调同一个套路。
+       */
+      if (process.platform === 'darwin') {
+        item.$win.setKiosk(true);
+      }
+      // show() 会把它抬到截图窗口之上，必须马上还回去（否则渲染端被判 occluded）
+      this.raiseInteractive(item.$win);
+    }
+    if (!item.loaded) {
+      return;
+    }
+    item.$win.webContents.send('SCREENSHOTS:freeze-veil', on);
   }
 
-  /** 除活动屏外全部压暗（预截完成之后调，之前必须保持全透明） */
-  private revealBlockWindows(active: Display): void {
-    for (const id of this.$blockWins.keys()) {
-      this.setBlockDim(id, id !== active.id);
+  /**
+   * 把某块屏的截图交给它的冻结画面窗口。
+   *
+   * 页面还没加载完就先存着，`did-finish-load` 时补发 —— 早发的 IPC 会直接丢掉。
+   */
+  private pushFreezeImage(displayId: number, png: Buffer): void {
+    const item = this.$freezeWins.get(displayId);
+    if (!item) {
+      return;
+    }
+    item.png = png;
+    if (!item.loaded || item.$win.isDestroyed()) {
+      return;
+    }
+    item.$win.webContents.send('SCREENSHOTS:freeze-image', png);
+  }
+
+  /** 每块屏都压暗（预截完成之后调，之前必须保持不显示） */
+  private revealFreezeVeils(): void {
+    for (const id of this.$freezeWins.keys()) {
+      this.setFreezeVeil(id, true);
     }
   }
 
-  private destroyBlockWindows(): void {
-    for (const $win of this.$blockWins.values()) {
-      if (!$win.isDestroyed()) {
-        $win.destroy();
+  /** 这块屏有没有可用的冻结画面（显示过、页面也加载完了） */
+  private freezeReady(displayId: number): boolean {
+    const item = this.$freezeWins.get(displayId);
+    return !!item && item.loaded && item.shown && !item.$win.isDestroyed();
+  }
+
+  private destroyFreezeWindows(): void {
+    for (const item of this.$freezeWins.values()) {
+      if (!item.$win.isDestroyed()) {
+        // 先退出 kiosk 再销毁：和截图窗口收尾一样，别把程序坞/菜单栏的
+        // presentation 状态留在"隐藏"上
+        if (process.platform === 'darwin') {
+          item.$win.setKiosk(false);
+        }
+        item.$win.destroy();
       }
     }
-    this.$blockWins.clear();
+    this.$freezeWins.clear();
   }
 
   /**
    * 截一块屏。
    *
    * `onGrabbed` 在**像素已经抓到手**、还没开始编码的那一刻回调。
-   * 遮罩就靠它抢时间：`toPng` 编码一块 5K 屏要几百毫秒，等编码完再压暗，
-   * 用户看到的就是"另一块屏慢半拍才黑下去"。抓完就压暗，编码在后面慢慢做。
+   * 压暗就靠它抢时间：`toPng` 编码一块 5K 屏要几百毫秒，等编码完再压暗，
+   * 用户看到的就是"另一块屏慢半拍才暗下去"。抓完就压暗，编码在后面慢慢做。
    */
   private async capture(
     display: Display,
@@ -1475,8 +1647,10 @@ export default class Screenshots extends Events {
     // 识别结果是"这块屏的"，不是"这一轮截图的"：换屏早于识别算完时，
     // 旧屏的结果绝不能贴到新屏上（坐标原点不同，框会整体错位）。
     // 换屏监听还没启动（开场那几十毫秒）时没有"当前屏"，照常下发。
-    const current = this.screenWatcher
-      .currentDisplay as Partial<Display> | null | undefined;
+    const current = this.screenWatcher.currentDisplay as
+      | Partial<Display>
+      | null
+      | undefined;
     if (current && current.id !== display.id) {
       return;
     }
@@ -1693,8 +1867,10 @@ export default class Screenshots extends Events {
       bounds[0],
     );
 
-    const current = this.screenWatcher
-      .currentDisplay as Partial<Display> | null | undefined;
+    const current = this.screenWatcher.currentDisplay as
+      | Partial<Display>
+      | null
+      | undefined;
     if (
       seq !== this.captureSeq ||
       !this.capturing ||
@@ -1886,6 +2062,26 @@ export default class Screenshots extends Events {
         return;
       }
       void this.sendPreciseEdges(region);
+    });
+
+    /**
+     * 光标进了某块屏的冻结画面：立刻查一次屏，别等 100ms 的轮询。
+     *
+     * 只认自己那些冻结画面发来的消息，别的窗口发来的一律忽略。
+     */
+    ipcMain.on('SCREENSHOTS:freeze-enter', (event) => {
+      if (!this.capturing) {
+        return;
+      }
+      const fromFreeze = [...this.$freezeWins.values()].some(
+        (item) =>
+          !item.$win.isDestroyed() &&
+          item.$win.webContents.id === event.sender.id,
+      );
+      if (!fromFreeze) {
+        return;
+      }
+      this.screenWatcher.nudge?.();
     });
   }
 }

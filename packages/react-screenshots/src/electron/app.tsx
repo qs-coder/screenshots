@@ -25,6 +25,14 @@ export default function App(): ReactElement {
   const [windows, setWindows] = useState<Bounds[]>([]);
   const [edges, setEdges] = useState<Bounds[]>([]);
   /**
+   * 整层隐身。
+   *
+   * 换屏时主进程会让这一层短暂消失：窗口是透明的，藏掉内容就等于藏掉窗口，
+   * 而每块屏底下都有一张一模一样的冻结画面（同一张截图 + 同一层压暗）顶着，
+   * 所以换图、搬窗口、改尺寸全在用户看不见的时候做完。
+   */
+  const [blank, setBlank] = useState(false);
+  /**
    * 每块屏的已解码底图。
    *
    * 来回换屏时最贵的一步是"解码一张全屏 PNG"（实测首次 1.1s、之后 60~90ms）。
@@ -174,12 +182,18 @@ export default function App(): ReactElement {
       setEdges(edgeBounds);
     };
 
+    /** 换屏期间整层隐身，见 `Screenshots#setBlank` */
+    const onBlank = (value: boolean) => {
+      setBlank(!!value);
+    };
+
     const onReset = () => {
       setUrl(undefined);
       setImage(null);
       setDisplay(undefined);
       setWindows([]);
       setEdges([]);
+      setBlank(false);
       // 一轮截图结束，把整批已解码底图连同 objectURL 一起放掉
       for (const { url } of decodedRef.current.values()) {
         URL.revokeObjectURL(url);
@@ -195,6 +209,7 @@ export default function App(): ReactElement {
     window.screenshots.on('preload', onPreload);
     window.screenshots.on('windows', onWindows);
     window.screenshots.on('edges', onEdges);
+    window.screenshots.on('blank', onBlank);
     window.screenshots.on('reset', onReset);
     // 告诉主进程页面准备完成
     window.screenshots.ready();
@@ -203,6 +218,7 @@ export default function App(): ReactElement {
       window.screenshots.off('preload', onPreload);
       window.screenshots.off('windows', onWindows);
       window.screenshots.off('edges', onEdges);
+      window.screenshots.off('blank', onBlank);
       window.screenshots.off('setLang', onSetLang);
       window.screenshots.off('reset', onReset);
       for (const { url } of decodedRef.current.values()) {
@@ -225,7 +241,7 @@ export default function App(): ReactElement {
   }, []);
 
   return (
-    <div className="body">
+    <div className="body" style={{ visibility: blank ? 'hidden' : undefined }}>
       <Screenshots
         url={url}
         imageElement={image}
