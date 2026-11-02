@@ -98,6 +98,37 @@ const windowTypes: Record<string, string | undefined> = {
 };
 
 /**
+ * 当前系统能不能用**透明窗口**当覆盖层。
+ *
+ * 冻结画面是"透明窗口 + 页面里画截图和压暗"，整个前提是窗口真的透明。Windows 上透明窗口
+ * 依赖 DWM 合成，而 **Windows 7 是可以关掉 DWM 的**（Basic/经典主题、远程桌面会话、
+ * "调整为最佳性能"）。关掉之后 `transparent: true` 会退化成不透明黑块 —— 冻结画面就成了
+ * 压在别的屏上的一块黑，比不盖还糟。Win8 之后 DWM 无法关闭，不必判断。
+ *
+ * 检测用两步：
+ * 1. 系统版本 ≥ 6.2（Win8）直接放行；
+ * 2. Win7 上只有 Electron ≤22（Win7 唯一能跑的版本）才有 `systemPreferences.isAeroGlassEnabled`，
+ *    新版本已经删掉这个 API，所以按可选调用处理；拿不到就当有合成（Win7 默认主题就是 Aero）。
+ */
+function transparentOverlaySupported(): boolean {
+  if (process.platform !== 'win32') {
+    return true;
+  }
+  const [majorPart = '0', minorPart = '0'] = process
+    .getSystemVersion()
+    .split('.');
+  const major = Number(majorPart);
+  const minor = Number(minorPart);
+  if (!Number.isFinite(major) || major > 6 || (major === 6 && minor >= 2)) {
+    return true;
+  }
+  const probe = (
+    systemPreferences as unknown as { isAeroGlassEnabled?: () => boolean }
+  ).isAeroGlassEnabled;
+  return typeof probe === 'function' ? probe.call(systemPreferences) : true;
+}
+
+/**
  * 多屏截图的两条硬约束（改这里之前先看 `freeze.ts` 与 `switchDisplay`）：
  *
  * 1. 每块屏上常驻一个「冻结画面」窗口：这张屏自己的截图 + 与活动屏同 alpha 的压暗。
@@ -1218,7 +1249,22 @@ export default class Screenshots extends Events {
    * 首帧也可能闪一下黑。等这块屏的像素抓到、要压暗了再 show（见 `setFreezeVeil`）。
    */
   private ensureFreezeWindows(): void {
-    if (process.platform === 'linux') {
+    /**
+     * Linux 整平台跳过，原因不在"没有这个约束"，而在**摆不动窗口**。
+     *
+     * 冻结画面的前提是"把窗口钉死在某块屏的 (x,y,w,h) 上"。Wayland 下客户端拿不到全局坐标，
+     * 窗口位置完全由合成器决定，`setBounds` 的 x/y 会被忽略 —— 这套东西根本表达不出来。
+     * X11 本来可以（多数发行版 Electron 默认还走 XWayland，定位是正常的），但这里没有区分
+     * 会话类型（`XDG_SESSION_TYPE` / `WAYLAND_DISPLAY`），索性一刀切跳过。
+     *
+     * 这条早退是从上一代「屏蔽窗口」继承下来的（Wayland 下同样无法定位），不是这一版新加的。
+     *
+     * 代价只落在多屏：单屏时冻结画面本来就被截图窗口完全盖住、不参与任何视觉；多屏则退化成
+     * "换屏直接搬窗口"（`switchDisplay` 里 `masked` 恒 false），换屏会闪一下，别的屏也挡不住点击。
+     *
+     * Windows 7 关掉 DWM 时同样不建（透明窗口会变黑块，见 `transparentOverlaySupported`）。
+     */
+    if (process.platform === 'linux' || !transparentOverlaySupported()) {
       return;
     }
 
@@ -1232,12 +1278,16 @@ export default class Screenshots extends Events {
       }
       created = true;
 
-      const $win = new BrowserWindow({
-        title: 'screenshots-freeze',
+      const bounds = {
         x: Math.floor(display.bounds.x),
         y: Math.floor(display.bounds.y),
         width: Math.floor(display.bounds.width),
         height: Math.floor(display.bounds.height),
+      };
+
+      const $win = new BrowserWindow({
+        title: 'screenshots-freeze',
+        ...bounds,
         useContentSize: true,
         type: windowTypes[process.platform] as string,
         frame: false,
@@ -1263,8 +1313,8 @@ export default class Screenshots extends Events {
          * 紧接着又是冻结画面里自带的那条 —— 看上去就是"顶上有两个任务栏"。
          * 老的纯黑遮罩同样被约束过，只是黑色错位看不出来；换成截图就藏不住了。
          *
-         * 只在 macOS 上开：Windows / Linux 没有这个约束，而那边的 kiosk 是
-         * "独占全屏到某块屏"，会把这里按 display 排好的 bounds 顶掉。
+         * 只在 macOS 上开：Windows 那边 kiosk 是"独占全屏到某块屏"，会把这里
+         * 按 display 排好的 bounds 顶掉；Windows 的尺寸问题走下面的 `setBounds`。
          */
         kiosk: process.platform === 'darwin',
         fullscreen: false,
@@ -1294,6 +1344,29 @@ export default class Screenshots extends Events {
       $win.on('closed', () => {
         this.$freezeWins.delete(display.id);
       });
+
+      /**
+       * **构造参数里的尺寸靠不住，建完必须再落一次 `setBounds`。**
+       *
+       * Windows 创建顶层窗口时会把尺寸夹到"主屏工作区"里，夹的是**宽高**，跟任务栏在哪条边无关：
+       * - 任务栏在底部（主屏 1536×864，工作区高 816）：主屏建出来 1536×816，副屏 2048×1152 也建出来 1536×816；
+       * - 任务栏在左侧（工作区 1488×864）：主屏建出来 1488×864，副屏同样被夹成 1488×864。
+       *
+       * 也就是说副屏不管多大，都直接套用主屏工作区的尺寸。窗口一旦建小，这块屏上就只有
+       * 左上角一小块"压暗的小截图"：整张图被压进小窗口里，图里自带的那条任务栏（横的或竖的）
+       * 跑到屏幕中间，边上再压着一条真实任务栏 —— 用户看到的就是"扩展屏出现小的遮罩图"
+       * 和"截图时多个任务栏"。
+       *
+       * 这个夹取只发生在**创建阶段**：创建后 `setBounds` 到真实尺寸能落地，之后 `show()`
+       * 也不会再被夹回去（已实测，任务栏在底部/左侧两种布局都验过）。截图窗口那边本来就
+       * 有一次 `setBounds`，所以只有冻结画面会中招 —— 老版纯黑遮罩同样中招，只是纯黑少一块
+       * 看不出来。
+       *
+       * 只对 win32 补：macOS 靠上面的 kiosk 盖满整屏，Linux 没有这个夹取。
+       */
+      if (process.platform === 'win32') {
+        $win.setBounds(bounds);
+      }
 
       // 冻结画面也要压在最上面：默认 floating 层级压不住那些常驻浮层，
       // 一旦被别的窗口盖住，用户就能看到真实桌面、也能点到底下的应用
