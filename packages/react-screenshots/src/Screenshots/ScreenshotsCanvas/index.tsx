@@ -9,6 +9,7 @@ import {
   useMemo,
   useRef,
 } from "react";
+import { isWithinClickSlop } from "../constants";
 import getSnapEdges from "../getSnapEdges";
 import useBounds from "../hooks/useBounds";
 import useCursor from "../hooks/useCursor";
@@ -62,6 +63,9 @@ export default memo(
     const [operation] = useOperation();
 
     const resizeOrMoveRef = useRef<string | undefined>(undefined);
+    // 位移是否已越过单击容差：抓手柄/拖选区时的按下抖动不该改动选区，
+    // 小选区尤其明显（几像素的抖动就能把框缩成一个点）
+    const isMoveRef = useRef<boolean>(false);
     const pointRef = useRef<Point | null>(null);
     const boundsRef = useRef<Bounds | null>(null);
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -101,6 +105,7 @@ export default memo(
         }
         if (!operation) {
           resizeOrMoveRef.current = resizeOrMove;
+          isMoveRef.current = false;
           pointRef.current = {
             x: e.clientX,
             y: e.clientY,
@@ -183,6 +188,15 @@ export default memo(
           ) {
             return;
           }
+          if (!isMoveRef.current) {
+            // 容差内不动框：单击手柄/选区时的手抖不该把选区推走或缩成点
+            if (
+              isWithinClickSlop(pointRef.current, { x: e.clientX, y: e.clientY })
+            ) {
+              return;
+            }
+            isMoveRef.current = true;
+          }
           updateBounds(e);
         } else {
           emitter.emit("pointermove", e);
@@ -198,7 +212,11 @@ export default memo(
           ) {
             return;
           }
-          updateBounds(e);
+          // 单击（没越过容差）不提交任何位移，避免吸附把框轻轻挪一下
+          if (isMoveRef.current) {
+            updateBounds(e);
+          }
+          isMoveRef.current = false;
           resizeOrMoveRef.current = undefined;
           pointRef.current = null;
           boundsRef.current = null;

@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { CLICK_SLOP, isWithinClickSlop } from "../constants";
 import getSnapEdges, {
   getPreciseRectAt,
   getWindowAt,
@@ -32,8 +33,8 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
 
   const elRef = useRef<HTMLDivElement>(null);
   const pointRef = useRef<Point | null>(null);
-  // 用来判断鼠标是否移动过
-  // 如果没有移动过位置，则pointerup时不更新
+  // 位移是否已越过单击容差。按下瞬间的抖动也走 pointermove，
+  // 只按"有没有移动过"判断的话，单击会退化成 1px 的框
   const isMoveRef = useRef<boolean>(false);
   const [position, setPosition] = useState<Position | null>(null);
   // 正在框选，此时框外还不能显示 not-allowed
@@ -86,30 +87,39 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
     [windows, edges, width, height]
   );
 
-  const updateBounds = useCallback(
-    (p1: Point, p2: Point, snap: boolean) => {
+  const computeBounds = useCallback(
+    (p1: Point, p2: Point, snap: boolean): Bounds | null => {
       if (!elRef.current) {
-        return;
+        return null;
       }
       const { x, y } = elRef.current.getBoundingClientRect();
 
-      boundsDispatcher.set(
-        getBoundsByPoints(
-          {
-            x: p1.x - x,
-            y: p1.y - y,
-          },
-          {
-            x: p2.x - x,
-            y: p2.y - y,
-          },
-          width,
-          height,
-          snap ? snapEdges : undefined
-        )
+      return getBoundsByPoints(
+        {
+          x: p1.x - x,
+          y: p1.y - y,
+        },
+        {
+          x: p2.x - x,
+          y: p2.y - y,
+        },
+        width,
+        height,
+        snap ? snapEdges : undefined
       );
     },
-    [width, height, snapEdges, boundsDispatcher]
+    [width, height, snapEdges]
+  );
+
+  const updateBounds = useCallback(
+    (p1: Point, p2: Point, snap: boolean): Bounds | null => {
+      const next = computeBounds(p1, p2, snap);
+      if (next) {
+        boundsDispatcher.set(next);
+      }
+      return next;
+    },
+    [computeBounds, boundsDispatcher]
   );
 
   const onPointerDown = useCallback(
@@ -163,6 +173,33 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
   );
 
   useEffect(() => {
+    /**
+     * 单击要选中的矩形：优先用**当前高亮的那一块**。
+     *
+     * 高亮框就是用户看到的框，单击确认它才符合预期；按坐标重新拾取的话，
+     * 容差内的抖动会把拾取点挪到旁边更小/更大的元素上，选出来的框和看到的不一样。
+     * 允许 CLICK_SLOP 的偏差，是为了"手抖一下点到框外"也仍然算点中。
+     */
+    const pickForClick = (clientX: number, clientY: number): Bounds | null => {
+      const rect = elRef.current?.getBoundingClientRect();
+      if (!rect) {
+        return null;
+      }
+      const x = clientX - rect.x;
+      const y = clientY - rect.y;
+      const hovered = hoverRef.current;
+      if (
+        hovered &&
+        x >= hovered.x - CLICK_SLOP &&
+        y >= hovered.y - CLICK_SLOP &&
+        x <= hovered.x + hovered.width + CLICK_SLOP &&
+        y <= hovered.y + hovered.height + CLICK_SLOP
+      ) {
+        return hovered;
+      }
+      return pickAt(x, y);
+    };
+
     const onPointerMove = (e: PointerEvent) => {
       // 底图还没提交时页面里没有 elRef，但坐标一样要记下来：
       // 用户经常在这几百毫秒里就把鼠标挪到目标窗口上，之后不再动了
@@ -196,6 +233,16 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
         syncHover(pos);
         return;
       }
+      if (!isMoveRef.current) {
+        // 容差内的位移是按下时的手抖，不是拖框：一旦认成拖框，
+        // 单击确认窗口就会缩成一个 1px 的点，高亮框也会跟着消失
+        if (
+          isWithinClickSlop(pointRef.current, { x: e.clientX, y: e.clientY })
+        ) {
+          return;
+        }
+        isMoveRef.current = true;
+      }
       // Alt/⌥ 是吸附的逃生口，需要精确到像素时按住它
       updateBounds(
         pointRef.current,
@@ -205,7 +252,6 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
         },
         !e.altKey
       );
-      isMoveRef.current = true;
     };
 
     const onPointerUp = (e: PointerEvent) => {
@@ -213,29 +259,39 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
         return;
       }
 
-      if (isMoveRef.current) {
+      const down = pointRef.current;
+      const wasDrag = isMoveRef.current;
+      pointRef.current = null;
+      isMoveRef.current = false;
+      setIsSelecting(false);
+
+      if (wasDrag) {
         onStart && onStart();
-        updateBounds(
-          pointRef.current,
+        const next = computeBounds(
+          down,
           {
             x: e.clientX,
             y: e.clientY,
           },
           !e.altKey
         );
-      } else {
-        const rect = elRef.current?.getBoundingClientRect();
-        const picked = rect && pickAt(e.clientX - rect.x, e.clientY - rect.y);
-        if (picked) {
-          // 微信式：单击直接选中光标所在的整个窗口或元素
-          boundsDispatcher.set(picked);
-        } else {
-          onStop && onStop();
+        // 拖出来的框小到没有意义（吸附还可能把两条边吸到一起），
+        // 说明用户其实只想单击确认，别把这个点当成选区提交
+        if (next && (next.width > CLICK_SLOP || next.height > CLICK_SLOP)) {
+          boundsDispatcher.set(next);
+          hoverRef.current = null;
+          setHover(null);
+          return;
         }
       }
-      pointRef.current = null;
-      isMoveRef.current = false;
-      setIsSelecting(false);
+
+      const picked = pickForClick(e.clientX, e.clientY);
+      if (picked) {
+        // 微信式：单击直接选中光标所在的整个窗口或元素
+        boundsDispatcher.set(picked);
+      } else {
+        onStop && onStop();
+      }
       hoverRef.current = null;
       setHover(null);
     };
@@ -246,7 +302,15 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", onPointerUp);
     };
-  }, [updateBounds, onStart, onStop, pickAt, syncHover, boundsDispatcher]);
+  }, [
+    updateBounds,
+    computeBounds,
+    onStart,
+    onStop,
+    pickAt,
+    syncHover,
+    boundsDispatcher,
+  ]);
 
   // 底图或识别结果晚到：光标没动也要把高亮和放大镜补上
   useEffect(() => {
