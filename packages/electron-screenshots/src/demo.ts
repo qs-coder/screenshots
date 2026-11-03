@@ -81,7 +81,15 @@ app.whenReady().then(() => {
     promptScreenPermission: true,
     detectEdges: true,
   });
-  screenshots.$view.webContents.openDevTools();
+  /**
+   * 渲染端 devtools 只在 `DEMO_DEVTOOLS=1` 时打开。
+   *
+   * 默认关掉：它是**独立窗口**，会一直浮在桌面上，截图时被原样拍进底图，
+   * 截图窗口收掉之后也还在 —— 排查"截图里有残影"时它本身就是干扰项。
+   */
+  if (process.env.DEMO_DEVTOOLS === '1') {
+    screenshots.$view.webContents.openDevTools();
+  }
 
   const mainWin = new BrowserWindow({
     title: 'electron-screenshots demo',
@@ -137,7 +145,14 @@ app.whenReady().then(() => {
     if (antiCapture) {
       mainWin.hide();
     }
-    await screenshots.startCapture();
+    try {
+      await screenshots.startCapture();
+    } catch (err) {
+      // 库现在会把"渲染端起不来 / 抓屏失败"这类错误抛出来（内部已回滚覆盖层），
+      // 宿主必须接住并把藏起来的主窗口还回来，否则表现就是"点了截图，应用消失"。
+      console.error('[demo] startCapture failed:', err);
+      restoreHost();
+    }
   };
 
   /** 截图结束（确定 / 取消 / 保存）后把宿主窗口还回来 */

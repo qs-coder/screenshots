@@ -153,8 +153,81 @@ const OVERLAY_LEVEL = 'screen-saver';
  * `+0ms` 窗口像素仍然整块在画面里（26.0%，和可见时 26.2% 一样）；
  * `+16ms` 剩 0.3%（只剩边缘那一圈）；`+50ms` 才 0.00%。
  * 也就是说"截图里那层宿主残影"不是玄学，就是抓早了一帧。
+ *
+ * 但这是**一台机器、一种窗口**测出来的，别把它当保证：Windows 上同样 50ms，
+ * 宿主主窗口（真实页面、有 preload）有时还在合成里 —— 抓到的是一张"窗口框还在、
+ * 内容已经清空"的半截画面，压进底图就是用户说的残影。所以 50ms 只是第一拍的
+ * 起点，真正的兜底是下面 `GRAB_*` 那一组"抓到画面不再变为止"。
  */
 const CAPTURE_SETTLE_MS = 50;
+
+/**
+ * 第一次抓屏之后，隔多久再抓一张做"画面还在不在变"的比对。
+ *
+ * 宿主窗口从 hide 到彻底从合成里消失，实测跨机器能差到 300ms 量级；
+ * 80ms 够走过 DWM 的一两帧，又不会把"从点击到画面锁住"明显拖长
+ * （这段和建窗口并行，通常被 `createWindow` 那 100~500ms 完全盖住）。
+ */
+const GRAB_STABLE_GAP_MS = 80;
+
+/**
+ * 一次截图里第一次抓屏最多抓几张。
+ *
+ * 3 张 = 首拍 + 两次校正，最坏多花 160ms。再多就没意义了：那已经不是
+ * "宿主窗口在消失"，而是屏幕本身一直在动（视频、动画），继续等只会一直等下去。
+ */
+const GRAB_MAX_ROUNDS = 3;
+
+/**
+ * 两张图差异超过这个比例就认为"画面还在变"，继续抓下一张。
+ *
+ * 采样点里 0.2% 不同 ≈ 全屏 4000 个点。消失中的窗口动辄占屏幕 10%~30%，
+ * 而光标闪烁、输入框光标这类变化只有几十个点，不会误判成"没稳定"。
+ */
+const GRAB_DIFF_RATIO = 0.002;
+
+/**
+ * 比对两张图时的采样步长（像素）。取质数，避免和屏幕宽度共振导致
+ * 永远只采到同一列。
+ */
+const GRAB_DIFF_SAMPLE_STEP = 61;
+
+/**
+ * 等渲染端就绪的上限。
+ *
+ * 渲染端首次启动实测 0.8~7s（冷启动、机械硬盘、宿主机主进程忙时更久），
+ * 所以给到 12s。超过就认为页面卡死/没加载出来：**必须抛出去**，
+ * 宿主才能把藏起来的主窗口还回来；无限等下去的表现就是"点了截图什么都没发生"，
+ * 而且宿主的会话状态（in-flight 标志）也跟着一起卡死。
+ */
+const RENDERER_READY_TIMEOUT = 12_000;
+
+/**
+ * 页面导航"发起后迟迟没提交"的看门狗间隔。
+ *
+ * `webContents.loadURL()` 只是**发起**导航，真正提交要等渲染进程应答。实测
+ * 应用里一个可见窗口都没有时（托盘应用、主窗口已经 `hide()` 才第一次建截图、
+ * 或者隐藏窗口里的 BrowserView），这次导航会一直挂在 pending 上：
+ * `getURL()` 是空的、`isLoading()` 一直是 true，`did-finish-load` 永远不来。
+ *
+ * 这种"卡在发起阶段"和"页面真的加载慢"是两回事：前者重新 `loadURL` 一次就能过，
+ * 后者重试也没用。所以单独设一个短看门狗，在超时之前就把卡住的导航重新踢一脚，
+ * 而不是干等 12s（那 12s 里用户看到的就是"点了截图没反应"）。
+ */
+const RENDERER_KICK_MS = 1_500;
+
+/** 最多踢几次：够走过"窗口刚显示、合成器还没就绪"这个窗口期，又不会无限重发 */
+const RENDERER_MAX_KICKS = 3;
+
+/**
+ * 兜底抓屏（`desktopCapturer.getSources`）一次调用的上限。
+ *
+ * 这条路只在 `node-screenshots` 用不了时才走（asar 里原生模块解析失败等），
+ * 而它在 Windows 上偶发不返回：采集流建不起来时既不 resolve 也不 reject。
+ * 正常一次全屏取源 300ms~2s，给 8s 已经很宽；超时就当失败，让调用方回滚，
+ * 不能让整次截图停在"等一个永远不来的 Promise"上。
+ */
+const DESKTOP_CAPTURER_TIMEOUT = 8_000;
 
 /**
  * 当前系统能不能用**透明窗口**当覆盖层。
@@ -231,6 +304,16 @@ export default class Screenshots extends Events {
   private settlePromise: Promise<void> | null = null;
 
   /**
+   * 本轮是不是还处在"第一波抓屏"。
+   *
+   * `settlePromise` 解决"等的是同一拍"，这个标记解决"谁要做稳定校正"：
+   * 第一波（所有屏幕同时开抓的那一次）每块屏都做 `grabUntilStable`，
+   * 后面的换屏补截只 await 一个早已 resolve 的 Promise（立即放行、不再校正），
+   * 因为那时宿主窗口早就从合成里消失了，多抓只是白花时间。
+   */
+  private settleFirst = true;
+
+  /**
    * 每次下发截图都自增。元素检测是异步的，靠它判断结果还对不对应当前这张图。
    */
   private captureSeq = 0;
@@ -288,7 +371,7 @@ export default class Screenshots extends Events {
   /**
    * 这一轮截图已经完整可见（底图亮出来、可以交互了）。
    *
-   * ESC 只在这之后才生效：之前窗口还是 opacity 0，用户看不见任何东西，
+   * ESC 只在这之后才生效：之前窗口还是整层隐身，用户看不见任何东西，
    * 此时允许取消会让 `startCapture` 的后续步骤（下发识别、开屏幕监听）跑在一个
    * 已经收尾的会话上。
    */
@@ -327,13 +410,48 @@ export default class Screenshots extends Events {
     }
   >();
 
-  private isReady = new Promise<void>((resolve) => {
-    ipcMain.once('SCREENSHOTS:ready', () => {
-      this.logger('SCREENSHOTS:ready');
+  /**
+   * `isReady` 的兑现函数。
+   *
+   * ⚠️ 这两个字段**必须声明在 `isReady` 之前**：类字段按声明顺序初始化，
+   * 写在后面的话 `= null` 会在 `isReady` 的 executor 执行完之后再跑一遍，
+   * 把刚捕获到的 resolve/reject 又覆盖成 null —— 于是 `isReady` 永远无法兑现，
+   * 每次截图都要干等到超时才报错（表现就是"有时能截、有时点半天没反应"）。
+   */
+  private resolveReady: (() => void) | null = null;
 
-      resolve();
-    });
+  private rejectReady: ((err: Error) => void) | null = null;
+
+  /**
+   * 渲染端就绪（`SCREENSHOTS:ready`）。
+   *
+   * 这个信号是**截图窗口能不能出画面的唯一前提**：没等到它就去建窗口、下发底图，
+   * 用户看到的是一个全屏透明窗口，点不掉也看不见；而 `startCapture` 会一直挂在这里，
+   * 宿主那边"抓屏中"的标志永远不复位 —— 表现就是"点了截图没反应，之后再也截不了"。
+   *
+   * 所以它必须能被**拒绝**，不能是个只能 resolve 的 promise：
+   * - 页面加载失败 / 渲染进程崩溃 → `failRendererReady()` 立刻拒绝（先自动重载一次）；
+   * - 一直不吭声 → 调用方 `waitRendererReady()` 用 `RENDERER_READY_TIMEOUT` 兜底。
+   */
+  private isReady = new Promise<void>((resolve, reject) => {
+    this.resolveReady = resolve;
+    this.rejectReady = reject;
   });
+
+  /** 就绪信号已经有结论了（成功或失败），后面的 ready 消息不再重复处理 */
+  private readySettled = false;
+
+  /** 渲染端确实起不来时的原因，`startCapture` 直接把它抛给宿主 */
+  private readyError: Error | null = null;
+
+  /** 页面加载失败自动重载的次数（只重试一次，避免死循环） */
+  private rendererReloads = 0;
+
+  /** 导航卡在 pending 上被重新发起的次数，见 `kickStalledNavigation` */
+  private rendererKicks = 0;
+
+  /** 导航看门狗的定时器 */
+  private kickTimer: NodeJS.Timeout | null = null;
 
   private screenWatcher: {
     currentDisplay: Display;
@@ -375,9 +493,11 @@ export default class Screenshots extends Events {
      */
     warmUpNodeScreenshots();
     this.listenIpc();
-    this.$view.webContents.loadURL(
-      `file://${require.resolve('@qs-coder/react-screenshots/dist/electron.html')}`,
-    );
+    // 拒绝路径没人 await 时（构造完就失败）不能变成 unhandledRejection，
+    // 真正的错误由 `waitRendererReady()` 重新抛给调用方
+    this.isReady.catch(() => {});
+    this.watchRenderer();
+    this.loadRenderer();
     /**
      * ESC 兜底：键盘焦点在渲染端时直接由 webContents 收下。
      *
@@ -391,6 +511,265 @@ export default class Screenshots extends Events {
     });
     if (opts?.lang) {
       this.setLang(opts.lang);
+    }
+  }
+
+  /** 渲染端页面的地址（asar 里也走同一套解析） */
+  private rendererUrl(): string {
+    return `file://${require.resolve('@qs-coder/react-screenshots/dist/electron.html')}`;
+  }
+
+  /**
+   * 加载（或重载）渲染端页面。
+   *
+   * 抽成方法是为了让 `did-fail-load` 能重试一次：asar 路径、编码后的产物、
+   * 偶发的 ERR_ABORTED 都可能让第一次加载失败，而页面一旦没起来，
+   * 后面所有截图都只能"挂住"。
+   */
+  private loadRenderer(): void {
+    try {
+      const url = this.rendererUrl();
+      this.logger('加载渲染端 %s', url);
+      this.$view.webContents.loadURL(url);
+    } catch (err) {
+      // require.resolve 失败（依赖没装/产物缺 dist）会同步抛，直接定成不可用
+      const message = err instanceof Error ? err.message : String(err);
+      this.failRendererReady(`渲染端页面解析失败：${message}`);
+    }
+  }
+
+  /**
+   * 盯住渲染端的加载/崩溃，把"页面根本没起来"变成一次明确的失败。
+   *
+   * 以前这里只有 `ipcMain.once('SCREENSHOTS:ready')`：页面要是加载失败，
+   * 这个 once 永远等不到，`startCapture` 就永久挂起 —— 宿主看到的是
+   * "主窗口藏了、截图窗没出来"，只能重启应用。
+   */
+  private watchRenderer(): void {
+    const { webContents } = this.$view;
+
+    // 用 on 而不是 once：重载后会再发一次，靠 `readySettled` 去重
+    ipcMain.on('SCREENSHOTS:ready', () => {
+      this.markRendererReady();
+    });
+
+    webContents.on('did-finish-load', () => {
+      this.logger('渲染端加载完成');
+      // 导航已经提交，看门狗没必要再跑
+      this.stopKickWatch();
+      // 加载成功就允许下一次失败再重试
+      this.rendererReloads = 0;
+      this.rendererKicks = 0;
+    });
+
+    webContents.on(
+      'did-fail-load',
+      (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+        // 子框架失败与截图无关；-3 是 ERR_ABORTED（主动重载/取消），不算失败
+        if (!isMainFrame || errorCode === -3) {
+          return;
+        }
+        this.logger(
+          '渲染端加载失败 %d %s %s',
+          errorCode,
+          errorDescription,
+          validatedURL,
+        );
+        this.retryOrFail(`did-fail-load ${errorCode} ${errorDescription}`);
+      },
+    );
+
+    webContents.on('render-process-gone', (_event, details) => {
+      this.logger('渲染进程退出 %o', details);
+      this.retryOrFail(`render-process-gone ${details?.reason ?? 'unknown'}`);
+    });
+
+    webContents.on('preload-error', (_event, preloadPath, error) => {
+      // preload 挂了 → 页面里没有 `window.screenshots`，ready 也不会来
+      this.logger('渲染端 preload 失败 %s %o', preloadPath, error);
+      this.retryOrFail(`preload-error ${preloadPath}`);
+    });
+  }
+
+  /**
+   * 导航看门狗：`loadURL()` 发起后如果迟迟没有提交，就重新踢一脚。
+   *
+   * 判据是 `webContents.getURL()`：导航一旦提交，这里立刻有值；一直为空
+   * 说明这次导航卡在了"发出去但渲染进程没应答"的状态。这种状态**不会自愈**，
+   * 也不会触发 `did-fail-load`（它压根没失败，只是没开始），所以只能主动重发。
+   *
+   * 实测触发场景：应用里一个可见窗口都没有时（托盘应用、主窗口已经 `hide()`
+   * 之后才第一次建截图实例、隐藏窗口里的 BrowserView），渲染进程拿不到合成器
+   * 的帧槽，导航就一直挂着。窗口一显示出来重发就能过。
+   */
+  private kickStalledNavigation(): void {
+    this.stopKickWatch();
+    if (this.readySettled) {
+      return;
+    }
+    this.kickTimer = setTimeout(() => {
+      this.kickTimer = null;
+      if (this.readySettled) {
+        return;
+      }
+      const { webContents } = this.$view;
+      if (webContents.isDestroyed()) {
+        return;
+      }
+      // 已经有 URL = 导航提交了，剩下的只是加载慢，交给总超时管
+      if (webContents.getURL()) {
+        return;
+      }
+      if (this.rendererKicks >= RENDERER_MAX_KICKS) {
+        this.logger('渲染端导航连续 %d 次未提交，不再重发', this.rendererKicks);
+        return;
+      }
+      this.rendererKicks += 1;
+      this.logger(
+        '渲染端导航未提交（第 %d 次），重新发起加载',
+        this.rendererKicks,
+      );
+      this.loadRenderer();
+      this.kickStalledNavigation();
+    }, RENDERER_KICK_MS);
+    // 看门狗不该拖着进程不退出
+    this.kickTimer.unref?.();
+  }
+
+  private stopKickWatch(): void {
+    if (this.kickTimer) {
+      clearTimeout(this.kickTimer);
+      this.kickTimer = null;
+    }
+  }
+
+  /** 加载/渲染失败：先自动重载一次，还不行就定成不可用 */
+  private retryOrFail(reason: string): void {
+    if (this.readySettled) {
+      return;
+    }
+    if (this.rendererReloads < 1) {
+      this.rendererReloads += 1;
+      this.logger('渲染端异常（%s），重载一次', reason);
+      // 让出这一轮，避免在 did-fail-load 回调里直接 loadURL 又被判成 ERR_ABORTED
+      setTimeout(() => {
+        this.loadRenderer();
+      }, 150);
+      return;
+    }
+    this.failRendererReady(reason);
+  }
+
+  private markRendererReady(): void {
+    if (this.readySettled) {
+      return;
+    }
+    this.readySettled = true;
+    this.stopKickWatch();
+    this.logger('SCREENSHOTS:ready');
+    this.resolveReady?.();
+  }
+
+  private failRendererReady(reason: string): void {
+    if (this.readySettled) {
+      return;
+    }
+    this.readySettled = true;
+    this.readyError = new Error(`截图渲染端不可用：${reason}`);
+    this.stopKickWatch();
+    this.logger('渲染端不可用 %s', reason);
+    this.rejectReady?.(this.readyError);
+  }
+
+  /**
+   * 等渲染端就绪，**超时就抛**。
+   *
+   * 这是"点了截图没反应"那条路的唯一出口：抛出去 → `startCapture` 回滚覆盖层
+   * 并把错误交给宿主 → 宿主 `catch` 里把藏起来的主窗口还回来。
+   * 宁可报错，也不能让宿主停在一个"窗口藏了、截图没出来"的死状态上。
+   */
+  private async waitRendererReady(): Promise<void> {
+    if (this.readySettled) {
+      if (this.readyError) {
+        throw this.readyError;
+      }
+      return;
+    }
+
+    // 先把看门狗挂上：导航要是卡在"发出去没应答"，1.5s 后就会重发，
+    // 不用等到 12s 总超时才动作
+    this.kickStalledNavigation();
+
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), RENDERER_READY_TIMEOUT);
+    });
+
+    try {
+      const result = await Promise.race([
+        this.isReady.then(() => 'ready' as const),
+        timeout,
+      ]);
+      if (result === 'timeout') {
+        // 一直不吭声：最后再给一次机会（页面可能白屏），仍不行就报错
+        this.logger('渲染端 %dms 未就绪，重载一次', RENDERER_READY_TIMEOUT);
+        this.loadRenderer();
+        const second = await Promise.race([
+          this.isReady.then(() => 'ready' as const),
+          new Promise<'timeout'>((resolve) => {
+            timer = setTimeout(
+              () => resolve('timeout'),
+              RENDERER_READY_TIMEOUT,
+            );
+          }),
+        ]);
+        if (second === 'timeout') {
+          throw new Error(
+            `截图渲染端 ${RENDERER_READY_TIMEOUT * 2}ms 内没有就绪（已重载一次）`,
+          );
+        }
+      }
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+
+    if (this.readyError) {
+      throw this.readyError;
+    }
+  }
+
+  /**
+   * 开始截图的过程中途失败时的回滚。
+   *
+   * 失败可能发生在任意一步之后（抓屏抛错、渲染端没就绪、建窗口抛错），
+   * 而这一步之前可能已经把冻结画面立起来、把截图窗口 show 出来（整层隐身）。
+   * 不回滚的话，用户面前会留下一层看不见又点不掉的覆盖层。
+   */
+  private abortStart(reason: unknown): void {
+    this.logger('startCapture 失败，回滚覆盖层 %o', reason);
+    this.capturing = false;
+    this.captureReady = false;
+    this.settlePromise = null;
+    this.settleFirst = true;
+    this.stopTopMostGuard();
+    this.stopScreenWatcher();
+    this.stopKickWatch();
+    this.unregisterEscShortcut();
+    this.destroyFreezeWindows();
+    this.shots.clear();
+    this.windowsByDisplay.clear();
+    this.edgesByDisplay.clear();
+    this.edgePixels.clear();
+    this.decodedInRenderer.clear();
+    this.edgeSource = undefined;
+    this.captureWindows = [];
+    const $win = this.$win;
+    if ($win && !$win.isDestroyed()) {
+      // 失败前可能停在"整层隐身"的预热态，恢复显示再藏，下一轮才不会整层空白
+      this.setBlank(false);
+      $win.hide();
     }
   }
 
@@ -557,6 +936,7 @@ export default class Screenshots extends Events {
      * 抓屏会先等 `captureSettleMs`（给宿主的 hide 留时间），这里晚一行就漏掉了。
      */
     this.settlePromise = null;
+    this.settleFirst = true;
     this.fallbackWarned = false;
 
     /**
@@ -581,99 +961,128 @@ export default class Screenshots extends Events {
     // unhandledRejection；错误本身仍由 Promise.all 抛给调用方
     shotPromise.catch(() => {});
 
-    // 建窗口里的 reset 要等渲染端回执，所以先把渲染端就绪排在最前面
-    await this.isReady;
-    mark('isReady');
-
     /**
-     * "先锁定屏幕"的关键：截屏+编码 与 建窗口（含 reset 等待）互不依赖，并行做，
-     * 于是第一帧出现的时间约等于 captureImage + toPng，而不是两者相加。
-     */
-    const [shot, $win] = await Promise.all([
-      shotPromise,
-      this.createWindow(display),
-    ]);
-    mark('capture + createWindow');
-
-    this.capturing = true;
-
-    const seq = ++this.captureSeq;
-    // 新一轮截图，上一轮的窗口几何和渲染端缓存作废
-    resetWindowCache();
-    this.windowsByDisplay.clear();
-    this.decodedInRenderer.clear();
-    this.shots.set(display.id, {
-      display,
-      png: shot.png,
-      image: shot.image,
-    });
-
-    /**
-     * 冻结画面先立起来：每块屏一张"自己的截图 + 30% 压暗"。
+     * 顺序是这一轮的关键，**先建窗口 → 再等底图 → 立刻显示 → 最后等渲染端**。
      *
-     * 必须排在截图窗口 show 之前：遮罩要"跟着截图一起出来"。
-     * 等绘制完再建就晚了几百毫秒，用户看到的是另一块屏先敞着、过一会儿才暗下去。
+     * 不能"等渲染端就绪再建窗口"：宿主在截图前已经把主窗口 `hide()` 掉了，这段时间
+     * 应用里一个可见窗口都没有，BrowserView 的渲染进程拿不到合成器的帧槽，导航就一直
+     * 挂在 pending 上 —— `kickStalledNavigation` 能重发，但发多少次都不会提交，只能等
+     * 12s 超时、再重载、再 12s 失败一次。实测冷启动后第一次截图必然中招。
      *
-     * 活动屏的截图此刻已经在手上（`shotPromise` 刚 resolve），压暗和画面直接给它；
-     * 其他屏要等自己那块抓完，见 `captureOtherDisplays`。
+     * 窗口一旦可见，导航立刻就能提交。所以窗口要尽早建、尽早显示（整层隐身，用户看不见），
+     * 把"等渲染端"这一步挪到显示之后。
      */
-    this.ensureFreezeWindows();
-    this.setFreezeVeil(display.id, true);
-    this.pushFreezeImage(display.id, shot.png);
-
-    /**
-     * 先以**全透明**显示，等渲染端把这一帧画完再亮出来。
-     *
-     * 不能"等画完再 show"：隐藏窗口里 rAF 不跑、解码也慢得离谱（实测首次解码要 1 秒以上，
-     * 而且经常等不到），主进程只能等到超时，截图窗口反而更晚出现。
-     * 也不能"先 show 再等图"：窗口先出现但里面什么都没画完，等图到了再"啪"地换上去。
-     * 所以取中间：显示（这样渲染进程才会正常出帧）但完全透明（用户看不见），
-     * 画好了再亮出来，用户看到的第一帧就是完整的截图。
-     *
-     * 亮出来的这一刻是**看不出变化**的：底下那张冻结画面早就是同一张图、同一层压暗，
-     * 换上来只是"同一画面换了个更靠前的窗口在画"。
-     */
-    $win.setOpacity(0);
-    $win.show();
-    mark('show');
-    // 从这一刻起守住最上层：别的应用随时可能把自己的浮层提到前面
-    this.startTopMostGuard();
-
-    /**
-     * 其他屏幕的预截**已经在 `grabAllDisplays` 里跟着活动屏一起发出了**，
-     * 这里只负责等它们落地、把画面和压暗交给各自的冻结窗口。
-     */
-    void this.captureOtherDisplays(display, pendingShots);
-
     try {
-      await this.prepareRenderer(display, shot.png);
-    } finally {
-      // 渲染端出问题也必须亮出来，否则用户面对的是一个看不见又点不掉的窗口
-      if (this.$win && !this.$win.isDestroyed()) {
-        this.$win.setOpacity(1);
+      const $early = this.ensureWindow(display);
+      mark('ensureWindow');
+
+      const shot = await shotPromise;
+      mark('capture');
+
+      this.capturing = true;
+
+      const seq = ++this.captureSeq;
+      // 新一轮截图，上一轮的窗口几何和渲染端缓存作废
+      resetWindowCache();
+      this.windowsByDisplay.clear();
+      this.decodedInRenderer.clear();
+      this.shots.set(display.id, {
+        display,
+        png: shot.png,
+        image: shot.image,
+      });
+
+      /**
+       * 冻结画面先立起来：每块屏一张"自己的截图 + 30% 压暗"。
+       *
+       * 必须排在截图窗口 show 之前：遮罩要"跟着截图一起出来"。
+       * 等绘制完再建就晚了几百毫秒，用户看到的是另一块屏先敞着、过一会儿才暗下去。
+       *
+       * 活动屏的截图此刻已经在手上（`shotPromise` 刚 resolve），压暗和画面直接给它；
+       * 其他屏要等自己那块抓完，见 `captureOtherDisplays`。
+       */
+      this.ensureFreezeWindows();
+      this.setFreezeVeil(display.id, true);
+      this.pushFreezeImage(display.id, shot.png);
+
+      /**
+       * 先以**整层隐身**显示，等渲染端把这一帧画完再亮出来。
+       *
+       * 不能"等画完再 show"：隐藏窗口里 rAF 不跑、解码也慢得离谱（实测首次解码要 1 秒以上，
+       * 而且经常等不到），主进程只能等到超时，截图窗口反而更晚出现。
+       * 也不能"先 show 再等图"：窗口先出现但里面什么都没画完，等图到了再"啪"地换上去。
+       * 所以取中间：显示（这样渲染进程才会正常出帧）但看不见内容，
+       * 画好了再亮出来，用户看到的第一帧就是完整的截图。
+       *
+       * 隐身手段是渲染端的 `visibility: hidden`，**不是 `win.setOpacity(0)`**。
+       * 早先这里用的是 `setOpacity(0)` → show → 画完再 `setOpacity(1)`，在硬件合成下没问题，
+       * 但在软件合成（应用侧一直带着 `--disable-gpu-compositing`）下，透明窗口一旦被
+       * 设成 opacity 0，就再也不会重新参与合成 —— 之后 `setOpacity(1)` 也不管用。
+       * 用户看到的就是"整块屏永远不出现"：冻结画面在、选区高亮在（那是渲染端画的），
+       * 而截图窗口自己的边框、工具栏一片空白。这与 `setBlank()` 里早就记下的
+       * "透明窗口对 setOpacity 支持不可靠"是同一件事，这里统一成同一套隐身机制。
+       *
+       * 亮出来的这一刻是**看不出变化**的：底下那张冻结画面早就是同一张图、同一层压暗，
+       * 换上来只是"同一画面换了个更靠前的窗口在画"。
+       */
+      this.setBlank(true);
+      $early.show();
+      mark('show');
+      // 从这一刻起守住最上层：别的应用随时可能把自己的浮层提到前面
+      this.startTopMostGuard();
+
+      /**
+       * 其他屏幕的预截**已经在 `grabAllDisplays` 里跟着活动屏一起发出了**，
+       * 这里只负责等它们落地、把画面和压暗交给各自的冻结窗口。
+       */
+      void this.captureOtherDisplays(display, pendingShots);
+
+      // 窗口已经可见，渲染端这才拿得到帧槽；就绪通常是一两百毫秒的事
+      await this.waitRendererReady();
+      mark('isReady');
+
+      /**
+       * reset 要等渲染端回执，只能排在就绪之后。它会顺带把渲染端的 `blank` 清掉
+       * （见渲染端 `onReset`），所以紧接着把隐身重新压一次，免得底图没到就先亮出来。
+       */
+      await this.createWindow(display);
+      this.setBlank(true);
+
+      try {
+        await this.prepareRenderer(display, shot.png);
+      } finally {
+        // 渲染端出问题也必须亮出来，否则用户面对的是一个看不见又点不掉的窗口
+        if (this.$win && !this.$win.isDestroyed()) {
+          this.setBlank(false);
+        }
       }
+      mark('send capture');
+
+      /**
+       * 底图已经亮出来了，从这一刻起 ESC 才允许取消。
+       *
+       * 全局快捷键放在这里而不是 `show` 之前：窗口先以整层隐身显示的那段时间
+       * 用户什么都看不见，这时候能取消的话，下面的识别与屏幕监听会跑在一个
+       * 已经收尾的会话上。
+       */
+      this.captureReady = true;
+      this.registerEscShortcut();
+
+      /**
+       * 两个拾取源都必须排在显示之后，而且要**先窗口后元素**。
+       * 一次截图里所有屏幕的识别结果都在这里一次算完，之后换屏只下发缓存。
+       */
+      void this.startRecognition(shot, display, seq);
+
+      // 跟手换屏（与微信、Snipaste 一致），否则扩展屏永远切不过去。
+      // 按下鼠标时渲染端会发 SCREENSHOTS:start 停掉监听，此时其他屏幕就被屏蔽窗口锁住。
+      this.startScreenWatcher(display);
+    } catch (err) {
+      // 任何一步失败都要把已经立起来的覆盖层收掉再把错误抛给宿主，
+      // 否则宿主停在"窗口藏了、截图没出来"的状态，只能重启
+      this.abortStart(err);
+      throw err;
     }
-    mark('send capture');
-
-    /**
-     * 底图已经亮出来了，从这一刻起 ESC 才允许取消。
-     *
-     * 全局快捷键放在这里而不是 `show` 之前：窗口先以 opacity 0 显示的那段时间
-     * 用户什么都看不见，这时候能取消的话，下面的识别与屏幕监听会跑在一个
-     * 已经收尾的会话上。
-     */
-    this.captureReady = true;
-    this.registerEscShortcut();
-
-    /**
-     * 两个拾取源都必须排在显示之后，而且要**先窗口后元素**。
-     * 一次截图里所有屏幕的识别结果都在这里一次算完，之后换屏只下发缓存。
-     */
-    void this.startRecognition(shot, display, seq);
-
-    // 跟手换屏（与微信、Snipaste 一致），否则扩展屏永远切不过去。
-    // 按下鼠标时渲染端会发 SCREENSHOTS:start 停掉监听，此时其他屏幕就被屏蔽窗口锁住。
-    this.startScreenWatcher(display);
   }
 
   /**
@@ -1102,6 +1511,7 @@ export default class Screenshots extends Events {
     this.capturing = false;
     // 下一轮重新计"抓屏前那一拍"与降级警告
     this.settlePromise = null;
+    this.settleFirst = true;
     this.fallbackWarned = false;
     // 22MB 级别的像素缓存，截图结束就放手，别占着宿主的内存
     this.edgeSource = undefined;
@@ -1139,7 +1549,14 @@ export default class Screenshots extends Events {
   public async setLang(lang: Partial<Lang>): Promise<void> {
     this.logger('setLang', lang);
 
-    await this.isReady;
+    // 渲染端还没起来就先等着（就绪后自然会带上新语言）；
+    // 起不来就别把异常漏成 unhandledRejection —— 构造函数里是浮动调用
+    try {
+      await this.waitRendererReady();
+    } catch (err) {
+      this.logger('setLang 跳过：渲染端不可用 %o', err);
+      return;
+    }
 
     this.$view.webContents.send('SCREENSHOTS:setLang', lang);
   }
@@ -1169,15 +1586,17 @@ export default class Screenshots extends Events {
   }
 
   /**
-   * 初始化窗口
+   * 建窗口 + 把视图挂上去，**不 show、也不 reset**。
+   *
+   * 单独抽出来是为了能"先建窗口、后等渲染端"（见 `startCapture`）：BrowserView 的渲染进程
+   * 在没有任何可见窗口时拿不到合成器的帧槽，导航会一直挂在 pending 上。窗口必须尽早建出来、
+   * 并且尽快显示（整层隐身），导航才有地方提交。
+   *
+   * 位置和尺寸也在这里落好：窗口还藏着的时候搬家最便宜，用户看不见中间态。
    */
-  private async createWindow(display: Display): Promise<BrowserWindow> {
-    const time = performance.now();
-    // 重置截图区域
-    await this.reset();
-
+  private ensureWindow(display: Display): BrowserWindow {
     // 复用未销毁的窗口
-    if (!this.$win || this.$win?.isDestroyed?.()) {
+    if (!this.$win || this.$win.isDestroyed()) {
       this.$win = new BrowserWindow({
         title: 'screenshots',
         x: display.x,
@@ -1268,34 +1687,48 @@ export default class Screenshots extends Events {
       });
     }
 
-    this.$win.setBrowserView(this.$view);
+    const $win = this.$win;
+    $win.setBrowserView(this.$view);
 
     // 适定平台
     if (process.platform === 'darwin') {
-      this.$win.setWindowButtonVisibility(false);
+      $win.setWindowButtonVisibility(false);
     }
 
     if (process.platform !== 'win32') {
-      this.$win.setVisibleOnAllWorkspaces(true, {
+      $win.setVisibleOnAllWorkspaces(true, {
         visibleOnFullScreen: true,
         skipTransformProcessType: true,
       });
     }
 
-    this.$win.blur();
-    this.$win.setBounds(display);
+    // 还藏着的时候落位置：显示之后再搬，用户会看到窗口跳一下
+    $win.blur();
+    $win.setBounds(display);
     this.$view.setBounds({
       x: 0,
       y: 0,
       width: display.width,
       height: display.height,
     });
-    this.assertTopMost(this.$win);
+    return $win;
+  }
+
+  /**
+   * 初始化窗口（渲染端就绪之后调用）：重置截图区域 + 落位置 + 断言置顶。
+   */
+  private async createWindow(display: Display): Promise<BrowserWindow> {
+    const time = performance.now();
+    // 重置截图区域（要等渲染端回执，所以只能排在就绪之后）
+    await this.reset();
+
+    const $win = this.ensureWindow(display);
+    this.assertTopMost($win);
     this.logger(
       'createWindow 耗时 %dms (含 reset)',
       Math.round(performance.now() - time),
     );
-    return this.$win;
+    return $win;
   }
 
   /**
@@ -1659,10 +2092,17 @@ export default class Screenshots extends Events {
    *
    * 这段等待和 `createWindow`（`reset` 要等渲染端回执，实测几十到几百毫秒）并行，
    * 所以"从点击到画面锁住"的耗时基本不变。
+   *
+   * @returns 本次是不是"本轮第一次"（是的话调用方还要接着做画面稳定校正，
+   *          见 `grabUntilStable`）——固定等待只能挡住大多数情况，挡不住全部
    */
-  private async settleBeforeGrab(): Promise<void> {
+  private async settleBeforeGrab(): Promise<boolean> {
+    // 第一波（grabAllDisplays 同一 tick 里发出的所有抓屏）都算"第一次"：
+    // 它们等的是同一个共享 Promise，之后各自做自己的稳定校正
+    const first = this.settleFirst;
     if (this.captureSettleMs <= 0) {
-      return;
+      this.settleFirst = false;
+      return false;
     }
     if (!this.settlePromise) {
       const startedAt = performance.now();
@@ -1677,6 +2117,62 @@ export default class Screenshots extends Events {
       });
     }
     await this.settlePromise;
+    this.settleFirst = false;
+    return first;
+  }
+
+  /**
+   * 抓屏校正：一直抓到画面不再变化为止（最多 `GRAB_MAX_ROUNDS` 张）。
+   *
+   * 为什么光靠 `captureSettleMs` 不够：那是一个固定值，而"宿主窗口从 hide 到
+   * 真的从合成里消失"跟窗口内容、GPU、DWM 状态都有关。实测同一台 Windows 上，
+   * 同样是 `hide()` 之后一两百毫秒抓，简单窗口已经干净，宿主主窗口（真实页面、
+   * 有 preload、带标题栏）却会抓到"窗口框还在、内容已经清空"的半截画面 ——
+   * 压进底图就是用户看到的残影，而且它会被 hover 高亮原样放大，特别扎眼。
+   *
+   * 校正的判据不是时间而是**画面本身**：隔 `GRAB_STABLE_GAP_MS` 再抓一张，
+   * 两张采样后差异小于 `GRAB_DIFF_RATIO` 就认为屏幕已经定格，用这一张；
+   * 否则继续（最多 3 张）。屏幕真的一直在动（视频）时也只多抓两张，
+   * 不会无限等下去。
+   *
+   * 代价基本被 `createWindow` 吃掉了：这一抓和建窗口是并行的，而建窗口
+   * （`reset` 等渲染回执）本身就要 100~500ms。
+   */
+  private async grabUntilStable(
+    monitor: { captureImage: () => Promise<ShotImage> },
+    first: ShotImage,
+  ): Promise<ShotImage> {
+    let current = first;
+
+    for (let round = 1; round < GRAB_MAX_ROUNDS; round++) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, GRAB_STABLE_GAP_MS);
+      });
+
+      let next: ShotImage;
+      try {
+        next = await monitor.captureImage();
+      } catch (err) {
+        // 校正拍失败就用手里的：这一拍只是"更保险"，不该把整次截图拖挂
+        this.logger('抓屏校正失败，沿用上一帧 %o', err);
+        return current;
+      }
+
+      const changed = imageDiffRatio(current, next);
+      current = next;
+      this.logger(
+        '抓屏校正 round=%d 变化 %s%%（阈值 %s%%）',
+        round,
+        (changed * 100).toFixed(2),
+        (GRAB_DIFF_RATIO * 100).toFixed(2),
+      );
+
+      if (changed < GRAB_DIFF_RATIO) {
+        break;
+      }
+    }
+
+    return current;
   }
 
   /**
@@ -1700,7 +2196,7 @@ export default class Screenshots extends Events {
       onGrabbed?.();
     };
 
-    await this.settleBeforeGrab();
+    const settled = await this.settleBeforeGrab();
 
     try {
       let time = performance.now();
@@ -1743,7 +2239,12 @@ export default class Screenshots extends Events {
         throw new Error(`Monitor.fromDisplay(${display.id}) get null`);
       }
 
-      const image = await monitor.captureImage();
+      let image = await monitor.captureImage();
+      // 只有"本轮第一次"才做稳定校正：后面那些（其他屏预截、换屏补截）抓的时候
+      // 宿主窗口早就没了，多抓只是白花时间
+      if (settled) {
+        image = await this.grabUntilStable(monitor, image);
+      }
       const imageCost = Math.round(performance.now() - time);
       time = performance.now();
       // 像素到手，屏幕内容已经定格：这时候压暗遮罩不会再影响这张图
@@ -1888,20 +2389,22 @@ export default class Screenshots extends Events {
       width: Math.floor(display.width * display.scaleFactor),
       height: Math.floor(display.height * display.scaleFactor),
     };
-    const first = await desktopCapturer.getSources({
-      types: ['screen'],
-      thumbnailSize,
-    });
+    const first = await withTimeout(
+      desktopCapturer.getSources({ types: ['screen'], thumbnailSize }),
+      DESKTOP_CAPTURER_TIMEOUT,
+      'desktopCapturer.getSources（兜底抓屏）',
+    );
     // 等一拍再取第二次：新建采集流要一点时间才会产出"当下"的帧，
     // 立刻重取大概率还是同一帧（等于没换）
     await new Promise<void>((resolve) => {
       setTimeout(resolve, FALLBACK_SECOND_GRAB_DELAY);
     });
     try {
-      const second = await desktopCapturer.getSources({
-        types: ['screen'],
-        thumbnailSize,
-      });
+      const second = await withTimeout(
+        desktopCapturer.getSources({ types: ['screen'], thumbnailSize }),
+        DESKTOP_CAPTURER_TIMEOUT,
+        'desktopCapturer.getSources（兜底抓屏第二次）',
+      );
       if (second.length) {
         this.logger(
           'SCREENSHOTS:capture 兜底取源两次，丢弃第一帧（%d 个源）',
@@ -2402,6 +2905,83 @@ export default class Screenshots extends Events {
       this.screenWatcher.nudge?.();
     });
   }
+}
+
+/**
+ * 两张截图之间"变了多少"（0~1，按采样点统计）。
+ *
+ * 采样而不是逐像素：1080p 是 200 万像素、5K 是 1400 万，逐像素比一遍纯属浪费；
+ * 窗口消失这种整块变化在 1/61 的采样下依然能被稳定检出，而光标闪烁、
+ * 进度条这类小改动不会被误判成"画面还在变"。
+ *
+ * 拿不到像素（窗口已关闭、原生层不给）时按"没变化"处理：校正只是保险，
+ * 不能因为它把整次截图弄挂。
+ */
+function imageDiffRatio(a: ShotImage, b: ShotImage): number {
+  if (a.width !== b.width || a.height !== b.height) {
+    return 1;
+  }
+
+  let pa: Uint8Array;
+  let pb: Uint8Array;
+  try {
+    const ra = a.toRawSync();
+    const rb = b.toRawSync();
+    pa = new Uint8Array(ra.buffer, ra.byteOffset, ra.byteLength);
+    pb = new Uint8Array(rb.buffer, rb.byteOffset, rb.byteLength);
+  } catch {
+    return 0;
+  }
+
+  const pixels = Math.min(pa.length, pb.length) >> 2;
+  let sampled = 0;
+  let changed = 0;
+  for (let i = 0; i < pixels; i += GRAB_DIFF_SAMPLE_STEP) {
+    const o = i << 2;
+    // 单通道差 6 以内算同一像素：压暗/抗锯齿造成的 ±1~2 抖动不该被算成变化
+    if (
+      Math.abs((pa[o] ?? 0) - (pb[o] ?? 0)) > 6 ||
+      Math.abs((pa[o + 1] ?? 0) - (pb[o + 1] ?? 0)) > 6 ||
+      Math.abs((pa[o + 2] ?? 0) - (pb[o + 2] ?? 0)) > 6
+    ) {
+      changed++;
+    }
+    sampled++;
+  }
+
+  return sampled ? changed / sampled : 0;
+}
+
+/**
+ * 给一个"可能永远不返回"的原生调用套上超时。
+ *
+ * 兜底抓屏走的是 `desktopCapturer.getSources`，它在 Windows 上偶发不返回
+ * （采集流建不起来时既不 resolve 也不 reject）。这条路径是"主方案已经不可用"
+ * 之后的最后一根稻草，如果它再挂住，`startCapture` 就彻底没救了 ——
+ * 宿主会停在"主窗口藏了、截图窗没出来"，用户只能重启应用。
+ *
+ * 超时按失败处理：抛出去 → `startCapture` 回滚覆盖层 → 宿主 `catch` 把窗口还回来。
+ */
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  what: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${what} 超时（${ms}ms 未返回）`));
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
 }
 
 /** 夹到屏幕内并保证最小尺寸，越界越严重就越没意义，直接返回 undefined 省一次 worker */
