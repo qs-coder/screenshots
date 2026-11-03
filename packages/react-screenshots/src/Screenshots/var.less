@@ -5,10 +5,13 @@
 
 @borders: {
   // left,top,width,height,transform
-  top: 0, 0, 100%, 2px, translateY(-50%);
-  right: 100%, 0, 2px, 100%, translateX(-50%);
-  bottom: 0, 100%, 100%, 2px, translateY(-50%);
-  left: 0, 0, 2px, 100%, translateX(-50%);
+  // 边框全部画在选区**外面**：画在里面（哪怕只压一半）会盖掉窗口最外那一圈像素，
+  // 视觉上就是"框住的窗口比真实窗口小了一点"。外沿正好等于选区边界，所以
+  // 蓝线内边 = 裁剪线，用户看到的就是导出的那几像素。
+  top: 0, 0, 100%, 2px, translateY(-100%);
+  right: 100%, 0, 2px, 100%, translateX(0);
+  bottom: 0, 100%, 100%, 2px, translateY(0);
+  left: 0, 0, 2px, 100%, translateX(-100%);
 };
 
 @points: {

@@ -10,13 +10,14 @@ import {
   useRef,
 } from "react";
 import { isWithinClickSlop } from "../constants";
-import getSnapEdges from "../getSnapEdges";
+import getSnapEdges, { createSnapLocks, type SnapLocks } from "../getSnapEdges";
 import useBounds from "../hooks/useBounds";
 import useCursor from "../hooks/useCursor";
 import useEmitter from "../hooks/useEmitter";
 import useHistory from "../hooks/useHistory";
 import useOperation from "../hooks/useOperation";
 import useStore from "../hooks/useStore";
+import quantizeBounds from "../quantizeBounds";
 import type { Bounds, Point } from "../types";
 import { HistoryItemType } from "../types";
 import getBoundsByPoints from "./getBoundsByPoints";
@@ -68,6 +69,8 @@ export default memo(
     const isMoveRef = useRef<boolean>(false);
     const pointRef = useRef<Point | null>(null);
     const boundsRef = useRef<Bounds | null>(null);
+    // 一次拖拽内的吸附锁，见 `snapToEdge`：吸住的边不会在阈值边界上来回弹
+    const snapLocksRef = useRef<SnapLocks>(createSnapLocks());
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
 
@@ -106,6 +109,8 @@ export default memo(
         if (!operation) {
           resizeOrMoveRef.current = resizeOrMove;
           isMoveRef.current = false;
+          // 上一次拖拽吸住的边不能带到这一次
+          snapLocksRef.current = createSnapLocks();
           pointRef.current = {
             x: e.clientX,
             y: e.clientY,
@@ -150,15 +155,18 @@ export default memo(
           boundsRef.current
         );
         boundsDispatcher.set(
-          getBoundsByPoints(
-            points[0],
-            points[1],
-            bounds,
-            width,
-            height,
-            resizeOrMoveRef.current,
-            // Alt/⌥ 是吸附的逃生口，需要精确到像素时按住它
-            e.altKey ? undefined : snapEdges
+          quantizeBounds(
+            getBoundsByPoints(
+              points[0],
+              points[1],
+              bounds,
+              width,
+              height,
+              resizeOrMoveRef.current,
+              // Alt/⌥ 是吸附的逃生口，需要精确到像素时按住它
+              e.altKey ? undefined : snapEdges,
+              e.altKey ? undefined : snapLocksRef.current
+            )
           )
         );
       },

@@ -1,4 +1,4 @@
-import type { SnapEdges } from '../getSnapEdges';
+import type { SnapEdges, SnapLocks } from '../getSnapEdges';
 import { snapToEdge } from '../getSnapEdges';
 import type { Bounds, Point } from '../types';
 
@@ -8,13 +8,14 @@ export default function getBoundsByPoints(
   width: number,
   height: number,
   edges?: SnapEdges,
+  locks?: SnapLocks,
 ): Bounds {
   if (edges) {
     // 两个角都参与吸附，和微信一致；后一个角不能吸到前一个角所在的边，否则会缩成 0 宽度
-    x1 = snapToEdge(x1, edges.xs);
-    y1 = snapToEdge(y1, edges.ys);
-    x2 = snapToEdge(x2, edges.xs, x1);
-    y2 = snapToEdge(y2, edges.ys, y1);
+    x1 = snapToEdge(x1, edges.xs, undefined, locks, 'x1');
+    y1 = snapToEdge(y1, edges.ys, undefined, locks, 'y1');
+    x2 = snapToEdge(x2, edges.xs, x1, locks, 'x2');
+    y2 = snapToEdge(y2, edges.ys, y1, locks, 'y2');
   }
 
   // 交换值

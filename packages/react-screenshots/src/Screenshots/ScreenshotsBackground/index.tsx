@@ -10,12 +10,19 @@ import {
 } from "react";
 import { CLICK_SLOP, isWithinClickSlop } from "../constants";
 import getSnapEdges, {
+  createSnapLocks,
   getPreciseRectAt,
-  getWindowAt,
   getRectAt,
+  getWindowAt,
+  isNearlySame,
+  REFINE_SLOP,
+  type SnapLocks,
+  sameBounds,
+  stabilizeHover,
 } from "../getSnapEdges";
 import useBounds from "../hooks/useBounds";
 import useStore from "../hooks/useStore";
+import quantizeBounds from "../quantizeBounds";
 import ScreenshotsMagnifier from "../ScreenshotsMagnifier";
 import type { Bounds, Point, Position } from "../types";
 import getBoundsByPoints from "./getBoundsByPoints";
@@ -45,6 +52,8 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
   // 只放 ref 不放 state —— 它不参与渲染，而 pointermove 每秒几十次，不该因它重挂监听器。
   const preciseRef = useRef<Bounds | null>(null);
   const hoverRef = useRef<Bounds | null>(null);
+  // 一次拖拽内的吸附锁，见 `snapToEdge`；按下时清空，上一次拖拽的锁不能带过来
+  const snapLocksRef = useRef<SnapLocks>(createSnapLocks());
   // 上一次发起精修的粗矩形标识，同一个矩形只问一次
   const lastRegionRef = useRef<string | null>(null);
   // 上一次发起精修的光标位置，结果回来要确认光标还没走远
@@ -94,18 +103,21 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
       }
       const { x, y } = elRef.current.getBoundingClientRect();
 
-      return getBoundsByPoints(
-        {
-          x: p1.x - x,
-          y: p1.y - y,
-        },
-        {
-          x: p2.x - x,
-          y: p2.y - y,
-        },
-        width,
-        height,
-        snap ? snapEdges : undefined
+      return quantizeBounds(
+        getBoundsByPoints(
+          {
+            x: p1.x - x,
+            y: p1.y - y,
+          },
+          {
+            x: p2.x - x,
+            y: p2.y - y,
+          },
+          width,
+          height,
+          snap ? snapEdges : undefined,
+          snap ? snapLocksRef.current : undefined
+        )
       );
     },
     [width, height, snapEdges]
@@ -119,7 +131,7 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
       }
       return next;
     },
-    [computeBounds, boundsDispatcher]
+    [computeBounds, boundsDispatcher],
   );
 
   const onPointerDown = useCallback(
@@ -133,10 +145,12 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
         y: e.clientY,
       };
       isMoveRef.current = false;
+      // 上一次拖拽吸住的边不能带到这一次
+      snapLocksRef.current = createSnapLocks();
       setIsSelecting(true);
       onStart && onStart();
     },
-    [bounds, onStart]
+    [bounds, onStart],
   );
 
   const pickAt = useCallback(
@@ -144,32 +158,67 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
       const rect = getPreciseRectAt(windows, preciseRef.current, x, y);
       return rect ?? getRectAt(windows, edges, x, y);
     },
-    [windows, edges]
+    [windows, edges],
   );
 
   /**
    * 按光标位置重算高亮。pointermove 和"识别结果到达"都会调用它：
    * 后者是因为开场识别要几百毫秒（Windows 上还要加首帧解码），
    * 用户往往已经把鼠标停在窗口上不动了 —— 只靠 pointermove 的话高亮永远不出现。
+   *
+   * 算出来的结果不直接上屏，先过一遍 `stabilizeHover`：光标还停在当前高亮框里时
+   * 不换框，这样压在两块候选的公共边上、或者手抖 1~2px 时，高亮都是稳的。
    */
   const syncHover = useCallback(
     (pos: Position | null) => {
-      const next = !bounds && pos ? pickAt(pos.x, pos.y) : null;
-      hoverRef.current = next;
-      setHover(next);
+      const prev = hoverRef.current;
+      let next: Bounds | null = null;
+      // 系统窗口是权威答案：光标在窗口里时高亮只能是这个窗口，元素矩形不能顶替它
+      let authoritative = false;
+      if (!bounds && pos) {
+        const win = getWindowAt(windows, pos.x, pos.y);
+        if (win) {
+          next = win;
+          // 窗口是权威答案，窗口之间也有优先级：列表按 z 从大到小排，排在前面的压在后面的身上。
+          // 优先级更高的窗口命中时就该立刻换 —— "元素 → 窗口"的升级（窗口数据常常晚到，
+          // 晚到也得立刻生效）同理，`prev` 根本不在窗口列表里，按 `prevIndex < 0` 走同一条路。
+          //
+          // 反方向（窗口 → 被它压住的那个）不走快路：两块窗口共用一条边时按坐标判会来回跳，
+          // 交给 `stabilizeHover` 的粘滞容差，跨过 `HOVER_STICK` 才换框。
+          const prevIndex = prev
+            ? windows.findIndex((item) => sameBounds(item, prev))
+            : -1;
+          const nextIndex = windows.findIndex((item) => sameBounds(item, win));
+          authoritative =
+            prevIndex < 0 || (nextIndex >= 0 && nextIndex < prevIndex);
+        } else {
+          next = pickAt(pos.x, pos.y);
+        }
+      }
+
+      const stable =
+        bounds || !pos
+          ? null
+          : stabilizeHover(prev, next, pos.x, pos.y, authoritative);
+
+      hoverRef.current = stable;
+      // 值没变就不提交：pointermove 每秒几十次，无谓的重渲染本身就是一种"抖"
+      if (!sameBounds(prev, stable)) {
+        setHover(stable);
+      }
       // 落在窗口之外才需要精修（窗口本来就有精确边界）；
       // 已经贴准过的矩形再问一遍只是白花一次 worker
       if (
-        next &&
+        stable &&
         pos &&
-        next !== preciseRef.current &&
+        !sameBounds(stable, preciseRef.current) &&
         !getWindowAt(windows, pos.x, pos.y)
       ) {
         cursorRef.current = pos;
-        requestRegion(next);
+        requestRegion(stable);
       }
     },
-    [bounds, pickAt, windows, requestRegion]
+    [bounds, pickAt, windows, requestRegion],
   );
 
   useEffect(() => {
@@ -250,7 +299,7 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
           x: e.clientX,
           y: e.clientY,
         },
-        !e.altKey
+        !e.altKey,
       );
     };
 
@@ -273,7 +322,7 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
             x: e.clientX,
             y: e.clientY,
           },
-          !e.altKey
+          !e.altKey,
         );
         // 拖出来的框小到没有意义（吸附还可能把两条边吸到一起），
         // 说明用户其实只想单击确认，别把这个点当成选区提交
@@ -355,9 +404,16 @@ export default memo(function ScreenshotsBackground({ onStart, onStop }: Screensh
         return;
       }
       applyPrecise(refined);
+      // 结果回来时用户可能已经挪到别的元素上（甚至移出了所有候选）：
+      // 只认"当前高亮的还是发起精修的这一块"。不校验的话，旧结果会把新元素的高亮顶掉，
+      // 或者把已经消失的高亮按旧光标位置贴回来 —— 视觉上就是框自己跳了一下
+      const prev = hoverRef.current;
+      if (!prev || !isNearlySame(prev, region, REFINE_SLOP)) {
+        return;
+      }
       // 高亮立刻换成这份准的矩形：用户停在元素上不动时不会再有 pointermove
       const next = getPreciseRectAt(windows, refined, cursor.x, cursor.y);
-      if (next) {
+      if (next && !sameBounds(prev, next)) {
         hoverRef.current = next;
         setHover(next);
       }

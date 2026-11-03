@@ -29,10 +29,14 @@
 
   // 微信式窗口识别：高亮光标所在的窗口，单击即整窗截图
   // 内部透出的是没有被遮罩压暗的画面，看起来和"已经框选好"一致
+  //
+  // 边框用 box-shadow 画在**外面**，不能用 border：
+  // border 属于元素盒内（border-box），会盖住窗口最外 2px，而且会把 background-origin
+  // 推到 padding box —— 内层底图跟着整体偏移 2px。两者叠加起来，高亮的窗口
+  // 既小了一圈又错位 2px，和点下去之后的选区对不上，视觉上就是"窗口抖了一下"。
   &-hover {
     position: absolute;
-    box-sizing: border-box;
-    border: 2px solid @border-color;
+    box-shadow: 0 0 0 2px @border-color;
     background-repeat: no-repeat;
     pointer-events: none;
   }

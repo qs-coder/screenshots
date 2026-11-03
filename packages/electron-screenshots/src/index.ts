@@ -39,6 +39,10 @@ import {
   getScreenAccess,
   resolveResponsibleApp,
 } from './screenPermission.js';
+import {
+  hasIndicatorCandidate,
+  stripRecordingIndicator,
+} from './stripIndicator.js';
 
 export type LoggerFn = (...args: unknown[]) => void;
 export type Logger = Debugger | LoggerFn;
@@ -106,6 +110,9 @@ export interface ScreenshotsOpts {
 }
 
 export type { Bounds };
+
+/** 一块屏的一次抓屏结果：PNG 给渲染端，`image` 留给元素识别取原生像素 */
+type Shot = { png: Buffer; image?: ShotImage | undefined };
 
 const windowTypes: Record<string, string | undefined> = {
   darwin: 'panel',
@@ -214,8 +221,14 @@ export default class Screenshots extends Events {
   /** 本轮第一次抓屏前要等的毫秒数，见 `ScreenshotsOpts.captureSettleMs` */
   private captureSettleMs: number;
 
-  /** 本轮"抓屏前的那一拍"已经等过了（只等第一次，其余屏与换屏补截不必再等） */
-  private settleDone = false;
+  /**
+   * 本轮"抓屏前的那一拍"。
+   *
+   * 存的是 **Promise 而不是布尔**：一轮里所有屏幕是同时开抓的（见 `grabAllDisplays`），
+   * 用一个共享的 Promise 才能让它们等的是同一个 50ms，而不是"谁先到谁等、
+   * 后到的一律不等" —— 后者会让后发的抓屏早 50ms 拍到宿主还没隐藏干净的画面。
+   */
+  private settlePromise: Promise<void> | null = null;
 
   /**
    * 每次下发截图都自增。元素检测是异步的，靠它判断结果还对不对应当前这张图。
@@ -543,7 +556,7 @@ export default class Screenshots extends Events {
      * 新一轮的两个一次性开关，必须在**发起抓屏之前**清掉：
      * 抓屏会先等 `captureSettleMs`（给宿主的 hide 留时间），这里晚一行就漏掉了。
      */
-    this.settleDone = false;
+    this.settlePromise = null;
     this.fallbackWarned = false;
 
     /**
@@ -554,8 +567,16 @@ export default class Screenshots extends Events {
      * 而快照必须是一开始那一刻的屏幕 —— 之后打开的所有东西都只应该被它盖在下面。
      *
      * 截图不依赖渲染端，所以这里只发起、不等待：真正的等待和建窗口一起做。
+     *
+     * **所有屏幕必须在这一刻一起开抓**，不能等活动屏抓完再去抓其它屏。
+     * macOS 的"屏幕录制"指示器（菜单栏右上角那个紫色圆点）在采集开始后约
+     * 200~300ms 才由 WindowServer 合成进画面，亮起后会持续两三秒 —— 这期间抓到的
+     * 画面会把圆点一起拍进去，而且是**写进像素**的，之后无论怎么合成都去不掉。
+     * 串行抓的话从第二块屏开始必然带点；同时开抓才能让每块屏都拿到不带点的那一帧。
+     * （微信的截图里没有这个点，就是因为它一轮只抓一次、都挤在同一个"冷"窗口里。）
      */
-    const shotPromise = this.capture(display);
+    const pendingShots = this.grabAllDisplays(display);
+    const shotPromise = pendingShots.get(display.id) as Promise<Shot>;
     // 这里只是先挂一个处理者：截图失败时下面等渲染端的这段时间不会变成
     // unhandledRejection；错误本身仍由 Promise.all 抛给调用方
     shotPromise.catch(() => {});
@@ -619,10 +640,10 @@ export default class Screenshots extends Events {
     this.startTopMostGuard();
 
     /**
-     * 其他屏幕的预截和这一帧的绘制**并行**跑：截完一块就把那块压暗，
-     * 不用等最慢的那块屏编码完。
+     * 其他屏幕的预截**已经在 `grabAllDisplays` 里跟着活动屏一起发出了**，
+     * 这里只负责等它们落地、把画面和压暗交给各自的冻结窗口。
      */
-    void this.captureOtherDisplays(display);
+    void this.captureOtherDisplays(display, pendingShots);
 
     try {
       await this.prepareRenderer(display, shot.png);
@@ -656,17 +677,51 @@ export default class Screenshots extends Events {
   }
 
   /**
-   * 预截其他屏幕。
+   * 一轮截图开始时，把所有屏幕的抓屏**同时**发出去。
    *
-   * 并行截、并行编码，耗时约等于最慢的那一块屏，不阻塞截图窗口显示。
-   * **每块屏的像素一抓到手就立刻压暗自己的冻结画面**（不等 PNG 编码）——
-   * 编码一块 5K 屏要几百毫秒，等编码完再压暗，几块屏会一块一块地暗下去，
-   * 用户看到的就是"遮罩没同步出来"。
-   * 编码完再把截图交给这个窗口：压暗已经在了，换成"压暗后的截图"是同一次变更，
-   * 亮度不变、内容就是抓那一刻的屏幕，看不出来。
+   * 只为了抢那个"冷"窗口，见 `startCapture` 里的说明：指示器要过两三百毫秒才被
+   * 合成进画面，所以每块屏的抓屏必须挤在同一瞬间，谁也不能排在别人后面。
+   *
+   * 返回值按 display.id 索引：活动屏那一条给 `startCapture` 的后续流程用，
+   * 其余的在 `captureOtherDisplays` 里消费。失败先在这里接住（不吞错误，只是不让它
+   * 变成 unhandledRejection），真正的处理仍在各自的调用点。
+   */
+  private grabAllDisplays(active: Display): Map<number, Promise<Shot>> {
+    const pending = new Map<number, Promise<Shot>>();
+    const targets: Display[] = [active];
+    for (const item of screen.getAllDisplays()) {
+      if (item.id !== active.id) {
+        targets.push(toDisplay(item));
+      }
+    }
+
+    for (const display of targets) {
+      const promise = this.capture(display);
+      promise.catch(() => {});
+      pending.set(display.id, promise);
+    }
+
+    this.logger(
+      '同时开抓 %d 块屏：%o',
+      targets.length,
+      targets.map((item) => item.id),
+    );
+    return pending;
+  }
+
+  /**
+   * 收下其他屏幕的预截结果。
+   *
+   * 抓屏本身在 `grabAllDisplays` 里就已经跟着活动屏一起发出了（为了同时开抓），
+   * 这里只等它们落地。因为抓得早，轮到这一步时多半已经编码完了 ——
+   * 所以画面和压暗是一起交给冻结窗口的，几块屏同时暗下去，不会一块一块地暗。
+   *
    * 失败只丢这一块屏的画面（换屏时再补截），不能让整次截图失败。
    */
-  private async captureOtherDisplays(active: Display): Promise<void> {
+  private async captureOtherDisplays(
+    active: Display,
+    pending: Map<number, Promise<Shot>>,
+  ): Promise<void> {
     const others = screen
       .getAllDisplays()
       .filter((display) => display.id !== active.id);
@@ -676,11 +731,8 @@ export default class Screenshots extends Events {
         others.map(async (item) => {
           const display = toDisplay(item);
           try {
-            const shot = await this.capture(display, () => {
-              if (this.capturing) {
-                this.setFreezeVeil(display.id, true);
-              }
-            });
+            // 抓屏已经同时发出去了，这里只等它落地；没有预发（新插进来的屏）才现场截
+            const shot = await (pending.get(display.id) ?? this.capture(display));
             // 期间截图可能已经结束，缓存留着没用还占内存
             if (!this.capturing) {
               return;
@@ -1049,7 +1101,7 @@ export default class Screenshots extends Events {
     this.stopScreenWatcher();
     this.capturing = false;
     // 下一轮重新计"抓屏前那一拍"与降级警告
-    this.settleDone = false;
+    this.settlePromise = null;
     this.fallbackWarned = false;
     // 22MB 级别的像素缓存，截图结束就放手，别占着宿主的内存
     this.edgeSource = undefined;
@@ -1602,26 +1654,29 @@ export default class Screenshots extends Events {
    * 用户看到的就是"截图里有一层自己应用的虚影/残影"。
    *
    * 实测（见 `CAPTURE_SETTLE_MS`）：0ms 抓 → 窗口整块还在；16ms → 只剩边缘；
-   * 50ms → 彻底干净。所以这里等 50ms，而且**只等本轮第一次**：
-   * 后面那些抓屏（其他屏预截、换屏补截）发生时窗口早就没了。
+   * 50ms → 彻底干净。所以这里等 50ms，而且**一轮只等一次**：所有屏幕是同时开抓的，
+   * 共享同一个 Promise，等的是同一拍；后面换屏补截时它早就 resolve 了，直接放行。
    *
    * 这段等待和 `createWindow`（`reset` 要等渲染端回执，实测几十到几百毫秒）并行，
    * 所以"从点击到画面锁住"的耗时基本不变。
    */
   private async settleBeforeGrab(): Promise<void> {
-    if (this.settleDone || this.captureSettleMs <= 0) {
+    if (this.captureSettleMs <= 0) {
       return;
     }
-    this.settleDone = true;
-    const startedAt = performance.now();
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, this.captureSettleMs);
-    });
-    this.logger(
-      '抓屏前等待 %dms（给宿主 hide 留合成时间，实际 %dms）',
-      this.captureSettleMs,
-      Math.round(performance.now() - startedAt),
-    );
+    if (!this.settlePromise) {
+      const startedAt = performance.now();
+      this.settlePromise = new Promise<void>((resolve) => {
+        setTimeout(resolve, this.captureSettleMs);
+      }).then(() => {
+        this.logger(
+          '抓屏前等待 %dms（给宿主 hide 留合成时间，实际 %dms）',
+          this.captureSettleMs,
+          Math.round(performance.now() - startedAt),
+        );
+      });
+    }
+    await this.settlePromise;
   }
 
   /**
@@ -1694,16 +1749,32 @@ export default class Screenshots extends Events {
       // 像素到手，屏幕内容已经定格：这时候压暗遮罩不会再影响这张图
       grab();
 
-      const buffer = await image.toPng(true);
+      const rawPng = await image.toPng(true);
       const pngCost = Math.round(performance.now() - time);
 
+      /**
+       * 把 macOS 的「屏幕录制」指示器从像素里擦掉（见 `stripIndicator`）。
+       *
+       * 时序上已经尽量避开了（一轮里所有屏幕同时开抓），但指示器亮起后会持续两三秒，
+       * 上一轮刚结束就再截一次时起点就是热的 —— 那一次只能靠这一步收尾。
+       * 找不到圆点时原样返回，只付一次 PNG 解码的代价。
+       */
+      const stripStart = performance.now();
+      let buffer = rawPng;
+      if (process.platform === 'darwin' && hasIndicatorCandidate(image, display.scaleFactor)) {
+        buffer = stripRecordingIndicator(rawPng, display.scaleFactor);
+      }
+      const stripCost = Math.round(performance.now() - stripStart);
+
       this.logger(
-        'SCREENSHOTS:capture 耗时 load %dms fromPoint %dms captureImage %dms toPng %dms png %dKB',
+        'SCREENSHOTS:capture 耗时 load %dms fromPoint %dms captureImage %dms toPng %dms strip %dms png %dKB%s',
         loadCost,
         fromPointCost,
         imageCost,
         pngCost,
+        stripCost,
         Math.round(buffer.length / 1024),
+        buffer === rawPng ? '' : '（已擦除指示器）',
       );
       return { png: buffer, image };
     } catch (err) {
