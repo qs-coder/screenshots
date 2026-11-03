@@ -1,0 +1,24 @@
+packages/react-screenshots/src/Screenshots/ScreenshotsCanvas/index.tsx
+  s_76b929391ed6ed::t_f0d31ccdd9b7a4 72-73,112-113,158-167
+  s_76b929391ed6ed::t_85520fd1364304 168-169
+packages/react-screenshots/src/Screenshots/ScreenshotsBackground/getBoundsByPoints.ts
+  s_76b929391ed6ed::t_ed84d8fdd52ba4 1,11,15-18
+packages/react-screenshots/src/Screenshots/ScreenshotsCanvas/getBoundsByPoints.ts
+  s_76b929391ed6ed::t_865dc819052d30 1,13,26-27,35,38,41,44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "56a1e9b427225dd25dfd0a6b75a5f9a13bbf78f8",
+  "prompts": {},
+  "sessions": {
+    "s_76b929391ed6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "989570b3-400f-4f62-938e-9c74daa954b7",
+        "model": "unknown"
+      },
+      "human_author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  }
+}
