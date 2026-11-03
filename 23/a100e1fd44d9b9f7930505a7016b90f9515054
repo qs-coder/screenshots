@@ -1,0 +1,21 @@
+packages/react-screenshots/src/Screenshots/ScreenshotsCanvas/index.tsx
+  s_76b929391ed6ed::t_e2fdeca3d01602 12,66-68,108,191-199,215-219
+packages/react-screenshots/src/Screenshots/ScreenshotsBackground/index.tsx
+  s_76b929391ed6ed::t_53320a91aba62d 11,36-37,90-91,93,97-108,111-122,176-202,236-245,262-268,270-271,278-284,287-294,305-313
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "23a100e1fd44d9b9f7930505a7016b90f9515054",
+  "prompts": {},
+  "sessions": {
+    "s_76b929391ed6ed": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "989570b3-400f-4f62-938e-9c74daa954b7",
+        "model": "glm-5.3"
+      },
+      "human_author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  }
+}
