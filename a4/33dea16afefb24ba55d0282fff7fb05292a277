@@ -1,0 +1,21 @@
+packages/electron-screenshots/package.json
+  s_b43c55c00c3d37::t_05446831da2dcc 3
+packages/react-screenshots/package.json
+  s_b43c55c00c3d37::t_05446831da2dcc 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a433dea16afefb24ba55d0282fff7fb05292a277",
+  "prompts": {},
+  "sessions": {
+    "s_b43c55c00c3d37": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec55a8cf-c97f-4839-9692-55e57e1ad7c0",
+        "model": "glm-5.3"
+      },
+      "human_author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  }
+}
