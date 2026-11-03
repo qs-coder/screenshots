@@ -1,0 +1,18 @@
+packages/electron-screenshots/README.md
+  h_b66c7b30fc5084 194-199
+packages/electron-screenshots/package.json
+  h_b66c7b30fc5084 3
+packages/react-screenshots/package.json
+  h_b66c7b30fc5084 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "18a899822b26f052ecec1bce734dfc6159c239f5",
+  "prompts": {},
+  "humans": {
+    "h_b66c7b30fc5084": {
+      "author": "陈朋磊 <chenpl3@chinatelecom.cn>"
+    }
+  }
+}
