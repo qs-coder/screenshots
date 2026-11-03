@@ -124,6 +124,22 @@ const windowTypes: Record<string, string | undefined> = {
 const FALLBACK_SECOND_GRAB_DELAY = 60;
 
 /**
+ * 覆盖层（截图窗口 + 冻结画面）用的窗口层级。
+ *
+ * 和微信、Snipaste 一样，覆盖层**压在菜单栏和程序坞之上**：整屏（含顶部那条和
+ * 底部那条）被同一张定格画面 + 同一层压暗盖住，亮度一致，光标划过去只有高亮在变；
+ * 选中的区域里也不会混进一条"活着的"、点得动的栏。
+ *
+ * 用 `screen-saver`（Electron 能给到的最高层级），是为了压住视频播放器、录屏工具、
+ * 各种 HUD 这些常驻浮层 —— 它们普遍比菜单栏还高，降一档就压不住了。
+ *
+ * 注意：**靠层级盖住 ≠ 把系统那两条藏起来**。早先是用 `kiosk: true` 让应用进全屏
+ * 演示模式，那是系统级的隐藏（菜单栏/程序坞真的被收走、还切了一次 Space），
+ * 用户看到的就是"截图一出来任务栏没了"。现在只靠窗口层级盖住，系统状态一动不动。
+ */
+const OVERLAY_LEVEL = 'screen-saver';
+
+/**
  * 抓屏前默认等多久，见 `ScreenshotsOpts.captureSettleMs`。
  *
  * 实测（macOS，宿主 `hide()` 之后立刻抓屏，按窗口区域的像素统计）：
@@ -1052,8 +1068,7 @@ export default class Screenshots extends Events {
       return;
     }
 
-    // 先清除 Kiosk 模式，然后取消全屏才有效
-    this.$win.setKiosk(false);
+    // 不再进 kiosk（见 enableLargerThanScreen 的注释），收尾就只剩常规的失焦 / 移除视图
     this.$win.blur();
     this.$win.blurWebView();
     this.$win.unmaximize();
@@ -1133,28 +1148,31 @@ export default class Screenshots extends Events {
         alwaysOnTop: true,
         /**
          * linux 下必须设置为false，否则不能全屏显示在最上层
-         * mac 下设置为false，否则可能会导致程序坞不恢复问题，且与 kiosk 模式冲突
+         * mac 下设置为false，否则可能会导致程序坞不恢复问题
          */
         fullscreen: false,
         // mac fullscreenable 设置为 true 会导致应用崩溃
         fullscreenable: false,
-        kiosk: true,
         backgroundColor: '#00000000',
         titleBarStyle: 'hidden',
         hasShadow: false,
         paintWhenInitiallyHidden: false,
         // mac 特有的属性
         roundedCorners: false,
-        enableLargerThanScreen: false,
+        /**
+         * macOS 会把窗口的 frame 夹进"可见区域"（让出菜单栏那 30 多个点）。
+         * 早先靠 `kiosk: true` 逃出这个夹取，代价是应用进全屏演示模式 —— 菜单栏和
+         * 程序坞被系统收走、还切了一次 Space（用户看到的就是"截图一出来任务栏没了"）。
+         * 现在改用这个开关：允许窗口超出屏幕范围，照样能盖满整屏（含菜单栏那条），
+         * 但不触发全屏，系统状态一动不动。
+         */
+        enableLargerThanScreen: true,
         acceptFirstMouse: true,
       });
 
       this.emit('windowCreated', this.$win);
       this.$win.on('show', () => {
-        // 先完成 kiosk 过渡,再断言置顶,最后抢焦点
-        // 原顺序 focus()->setKiosk(true) 会在窗口已可见但置顶/焦点尚未最终断言时
-        // 留出脆弱窗口期,Windows 上偶发层级不在最上
-        this.$win?.setKiosk(true);
+        // 断言置顶，最后抢焦点
         this.assertTopMost(this.$win);
         this.$win?.focus();
       });
@@ -1235,9 +1253,9 @@ export default class Screenshots extends Events {
    * 都在更高的层级上，于是截图窗口会"跑到别的窗口底下"—— 用户看到的是一半截图、
    * 一半别人的界面，还以为截图坏了。
    *
-   * `screen-saver` 是 Electron 能给的最高层级：
+   * 所以抬到 `OVERLAY_LEVEL`（`screen-saver`，Electron 能给到的最高层级）：
    * - Windows 上从 floating 到 status 都排在任务栏之下，只有 pop-up-menu 及以上才在任务栏之上；
-   * - macOS 上对应 NSScreenSaverWindowLevel，能压住绝大多数常驻浮层。
+   * - macOS 上对应 NSScreenSaverWindowLevel，能压住菜单栏、程序坞和绝大多数常驻浮层。
    *
    * `moveTop()` 负责同层级内的相对顺序（同层级时它才是决定谁在上面的那个）。
    * https://www.electronjs.org/docs/latest/api/browser-window#winsetalwaysontopflag-level-relativellevel
@@ -1246,21 +1264,21 @@ export default class Screenshots extends Events {
     if (!$win || $win.isDestroyed()) {
       return;
     }
-    $win.setAlwaysOnTop(true, 'screen-saver');
+    $win.setAlwaysOnTop(true, OVERLAY_LEVEL);
     $win.moveTop();
   }
 
   /**
    * 把截图窗口和所有冻结画面一起抬回最上层，**截图窗口必须在最后**。
    *
-   * 顺序不能反：冻结画面和截图窗口同在 `screen-saver` 层级，谁后抬谁在上面。
+   * 顺序不能反：冻结画面和截图窗口同在 `OVERLAY_LEVEL` 层级，谁后抬谁在上面。
    * 冻结画面一旦压住活动屏的截图窗口，macOS 会把截图窗口判成 occluded，
    * 渲染端被节流（rAF 停、定时器拖到 1s），换屏就开始"追不上光标"。
    */
   private raiseAll(): void {
     for (const item of this.$freezeWins.values()) {
       if (!item.$win.isDestroyed()) {
-        item.$win.setAlwaysOnTop(true, 'screen-saver');
+        item.$win.setAlwaysOnTop(true, OVERLAY_LEVEL);
       }
     }
     this.assertTopMost(this.$win);
@@ -1373,17 +1391,16 @@ export default class Screenshots extends Events {
         skipTaskbar: true,
         alwaysOnTop: true,
         /**
-         * **必须盖住菜单栏**，和截图窗口用同一套办法（kiosk）。
+         * **必须盖满整屏（含菜单栏那 30 多个点）**，否则页面里的截图会整体下移：
+         * 屏幕顶部露出真实的菜单栏，紧接着又是冻结画面里自带的那条 —— 看上去就是
+         * "顶上有两个任务栏"。
          *
-         * macOS 会把普通窗口的 frame 约束进"可见区域"（去掉菜单栏那 30 多个点），
-         * 于是窗口整体下移、页面里的截图跟着错位：屏幕顶部露出真实的菜单栏，
-         * 紧接着又是冻结画面里自带的那条 —— 看上去就是"顶上有两个任务栏"。
-         * 老的纯黑遮罩同样被约束过，只是黑色错位看不出来；换成截图就藏不住了。
-         *
-         * 只在 macOS 上开：Windows 那边 kiosk 是"独占全屏到某块屏"，会把这里
-         * 按 display 排好的 bounds 顶掉；Windows 的尺寸问题走下面的 `setBounds`。
+         * macOS 会把窗口的 frame 夹进"可见区域"。早先靠 `kiosk: true` 逃出夹取，
+         * 代价是系统进全屏演示模式、菜单栏和程序坞被藏起来；现在改成
+         * `enableLargerThanScreen`：允许超出屏幕范围，但不触发全屏。
+         * 盖住之后由 `OVERLAY_LEVEL` 保证它压在菜单栏/程序坞之上。
          */
-        kiosk: process.platform === 'darwin',
+        enableLargerThanScreen: true,
         fullscreen: false,
         // mac fullscreenable 设置为 true 会导致应用崩溃（与截图窗口同因）
         fullscreenable: false,
@@ -1429,15 +1446,14 @@ export default class Screenshots extends Events {
        * 有一次 `setBounds`，所以只有冻结画面会中招 —— 老版纯黑遮罩同样中招，只是纯黑少一块
        * 看不出来。
        *
-       * 只对 win32 补：macOS 靠上面的 kiosk 盖满整屏，Linux 没有这个夹取。
+       * 三个平台都补：Windows 是上面那条尺寸夹取，macOS 是 frame 夹进可见区域
+       * （配合 `enableLargerThanScreen` 才彻底生效），Linux 多调一次也无副作用。
        */
-      if (process.platform === 'win32') {
-        $win.setBounds(bounds);
-      }
+      $win.setBounds(bounds);
 
       // 冻结画面也要压在最上面：默认 floating 层级压不住那些常驻浮层，
       // 一旦被别的窗口盖住，用户就能看到真实桌面、也能点到底下的应用
-      $win.setAlwaysOnTop(true, 'screen-saver');
+      $win.setAlwaysOnTop(true, OVERLAY_LEVEL);
 
       // 它必须可聚焦光标才会更新，所以一拿到焦点就立刻还给截图窗口
       $win.on('focus', () => {
@@ -1516,12 +1532,18 @@ export default class Screenshots extends Events {
     if (on && !item.shown) {
       item.shown = true;
       item.$win.show();
-      /**
-       * show 之后再补一次 kiosk：构造时窗口还没上屏，那一次的 frame 调整会落在
-       * "可见区域"里（被菜单栏挡掉 30 多个点）。和截图窗口的 `show` 回调同一个套路。
-       */
+      // 上屏后再落一次 bounds：macOS 的 frame 夹取可能发生在第一次上屏时，
+      // 而 `enableLargerThanScreen` 下这次 setBounds 才真正盖满整屏
       if (process.platform === 'darwin') {
-        item.$win.setKiosk(true);
+        const display = screen.getAllDisplays().find((d) => d.id === displayId);
+        if (display) {
+          item.$win.setBounds({
+            x: Math.floor(display.bounds.x),
+            y: Math.floor(display.bounds.y),
+            width: Math.floor(display.bounds.width),
+            height: Math.floor(display.bounds.height),
+          });
+        }
       }
       // show() 会把它抬到截图窗口之上，必须马上还回去（否则渲染端被判 occluded）
       this.raiseInteractive(item.$win);
@@ -1565,11 +1587,6 @@ export default class Screenshots extends Events {
   private destroyFreezeWindows(): void {
     for (const item of this.$freezeWins.values()) {
       if (!item.$win.isDestroyed()) {
-        // 先退出 kiosk 再销毁：和截图窗口收尾一样，别把程序坞/菜单栏的
-        // presentation 状态留在"隐藏"上
-        if (process.platform === 'darwin') {
-          item.$win.setKiosk(false);
-        }
         item.$win.destroy();
       }
     }
