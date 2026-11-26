@@ -1,6 +1,6 @@
 {
   "name": "@qs-coder/electron-screenshots",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "electron 截图插件",
   "types": "lib/index.d.ts",
   "main": "lib/index.cjs.js",
@@ -15,6 +15,7 @@
     "start": "cross-env DEBUG=electron-screenshots electron lib/demo.js",
     "dev": "tsc --sourceMap --watch",
     "build": "npm run clean && tsc",
+    "test:backend": "node scripts/test-capture-backend.cjs",
     "clean": "rimraf lib"
   },
   "repository": {

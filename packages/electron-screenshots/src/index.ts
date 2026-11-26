@@ -16,6 +16,10 @@ import {
 } from 'electron';
 import fs from 'fs-extra';
 import type { Image as ShotImage } from 'node-screenshots';
+import {
+  type CaptureBackendOption,
+  configureCaptureBackend,
+} from './captureBackend.js';
 import { isEdgesDebugEnabled, writeEdgesDebugImage } from './edgesDebug.js';
 import Event from './event.js';
 import { FREEZE_HTML } from './freeze.js';
@@ -107,6 +111,19 @@ export interface ScreenshotsOpts {
    * 传 0 关闭（宿主自己保证抓屏时窗口已经不在画面上）。
    */
   captureSettleMs?: number;
+  /**
+   * 抓屏后端：`auto`（默认）/ `native` / `electron`。
+   *
+   * `auto` 在 Linux Wayland 会话（已知 UKUI）下禁掉 `node-screenshots` 原生后端，
+   * 改走 Electron `desktopCapturer`：这些桌面的 libwayshot 要求
+   * `zxdg_output_manager_v1` v3 且需要 wlroots 截图协议，不满足时会在原生回调里
+   * `panic!` 并 `SIGABRT` 整个主进程，JS 无法捕获。X11 / macOS / Windows 仍走原生。
+   *
+   * 在确认原生后端可用的 wlroots 合成器（Sway / Hyprland 等）上可传 `native`；
+   * 也可用环境变量 `ELECTRON_SCREENSHOTS_CAPTURE_BACKEND=native|electron|auto` 覆盖。
+   * 切到 Electron 后端后窗口识别不可用（没有 `Window.all()`），拾取退化为元素边/手动框选。
+   */
+  captureBackend?: CaptureBackendOption;
 }
 
 export type { Bounds };
@@ -486,6 +503,11 @@ export default class Screenshots extends Events {
     this.isDetectEdges = opts?.detectEdges || false;
     this.edgeThresholds = opts?.edgeThresholds;
     this.captureSettleMs = opts?.captureSettleMs ?? CAPTURE_SETTLE_MS;
+    /**
+     * 后端选择必须早于原生模块预热：UKUI Wayland 上原生库能加载，但一调用就 abort。
+     * `auto` 判定为 Electron 后端时，`warmUpNodeScreenshots()` 只记原因、不 require。
+     */
+    configureCaptureBackend(opts?.captureBackend);
     /**
      * 先依赖：原生模块在这里同步加载掉（实测几毫秒），第一次截图不用再等，
      * 加载失败的原因也能在构造时就落到 `getNodeScreenshotsLoadError()` 里。
@@ -2380,8 +2402,8 @@ export default class Screenshots extends Events {
       this.fallbackWarned = true;
       const reason = getNodeScreenshotsLoadError();
       this.logger(
-        '抓屏退化到 desktopCapturer：画面可能带宿主刚隐藏窗口的残影，窗口识别同时不可用%s',
-        reason ? `（${reason.message}）` : '',
+        '抓屏退化到 desktopCapturer（原生后端不可用：%s）：画面可能带宿主刚隐藏窗口的残影，窗口识别同时不可用',
+        reason?.message ?? '未知原因',
       );
     }
 

@@ -1,6 +1,10 @@
 import { createRequire } from 'node:module';
 import process from 'node:process';
 import type { Image, Monitor, Window } from 'node-screenshots';
+import {
+  type CaptureBackend,
+  getCaptureBackendDecision,
+} from './captureBackend.js';
 
 /**
  * 在 **asar 打包环境**里可靠地加载 `node-screenshots`。
@@ -42,6 +46,12 @@ import type { Image, Monitor, Window } from 'node-screenshots';
  * 会在宿主 `require('@qs-coder/electron-screenshots')` 的那一刻把整个插件带崩，
  * 下面的降级路径（`fallbackSources` 的 desktopCapturer、`getWindows` 的空列表、
  * `getNodeScreenshotsLoadError()` 的诊断日志）全都建立在"加载失败可捕获"之上。
+ *
+ * 还有一道更靠前的门禁（`captureBackend`）：UKUI Wayland 上 **require 本身是成功的**，
+ * 但 `Monitor.fromPoint` / `captureImage` 会让 libwayshot 在非 unwind 上下文里
+ * `panic!`，直接 `SIGABRT` 掉整个 Electron 进程 —— JS 的 try/catch 根本接不住。
+ * 所以判定为 Electron 后端时这里连 require 都不做，所有原生入口拿到的都是 null / 抛错，
+ * 统一落到已有的 `desktopCapturer` 与空窗口列表降级路径。
  */
 
 export interface NodeScreenshotsModule {
@@ -58,8 +68,19 @@ let cached: NodeScreenshotsModule | null = null;
 /** 上一次加载失败的原因，供调用方写进日志（加载器本身不打日志） */
 let loadError: Error | null = null;
 
-/** 是否已经解析过（成功和失败都算），保证只跑一次 */
+/** 是否已经解析过（成功和失败都算），保证同一后端只跑一次 */
 let resolved = false;
+
+/** 上次解析对应的后端；后端被显式切换时允许重新解析 */
+let resolvedForBackend: CaptureBackend | null = null;
+
+/** 当前后端是否禁止使用原生模块；返回可直接写进日志的原因 */
+function backendDisabledError(): Error | null {
+  const decision = getCaptureBackendDecision();
+  return decision.backend === 'electron'
+    ? new Error(`原生抓屏后端已禁用：${decision.reason}`)
+    : null;
+}
 
 /** 导出齐不齐。`Monitor`/`Window` 是我们唯一依赖的两个入口 */
 function usable(mod: unknown): mod is NodeScreenshotsModule {
@@ -95,12 +116,23 @@ function attempt(
   return false;
 }
 
-/** 只解析一次；成功填 `cached`，失败填 `loadError` */
+/** 同一后端只解析一次；成功填 `cached`，失败填 `loadError` */
 function resolve(): void {
-  if (resolved) {
+  const currentBackend = getCaptureBackendDecision().backend;
+  if (resolved && resolvedForBackend === currentBackend) {
     return;
   }
   resolved = true;
+  resolvedForBackend = currentBackend;
+  cached = null;
+  loadError = null;
+
+  // 后端门禁必须在 require 之前：UKUI Wayland 上原生库加载成功但调用即 abort
+  const disabled = backendDisabledError();
+  if (disabled) {
+    loadError = disabled;
+    return;
+  }
 
   const problems: string[] = [];
 
@@ -136,6 +168,8 @@ function resolve(): void {
  * 给"启动时就先依赖"的场合用（`Screenshots` 构造时调一次）：首次 `require`
  * 的几毫秒挪到宿主启动阶段，第一次截图不必再等；加载失败也只是把原因记下来，
  * 后面所有调用方照常走降级路径，不会把插件带崩。
+ *
+ * 后端被判定为 Electron 时这里只记原因、不碰原生库，避免"预热就 abort"。
  */
 export function warmUpNodeScreenshots(): void {
   resolve();
@@ -167,7 +201,7 @@ export function requireNodeScreenshots(): NodeScreenshotsModule {
   return mod;
 }
 
-/** 加载失败原因；加载成功时为 null */
+/** 加载失败原因；加载成功时为 null，后端被禁用时返回禁用原因 */
 export function getNodeScreenshotsLoadError(): Error | null {
   resolve();
   return loadError;
@@ -183,4 +217,5 @@ export function resetNodeScreenshotsCache(): void {
   cached = null;
   loadError = null;
   resolved = false;
+  resolvedForBackend = null;
 }

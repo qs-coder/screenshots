@@ -210,7 +210,9 @@ const screenshots = new Screenshots({
   1. 抓屏退到 `desktopCapturer.getSources` 兜底 —— 它是"新建采集流取第一帧"，第一帧可能是更早的合成结果，宿主刚 `hide()` 的窗口就在里面（又一层残影来源），而且整条路慢且不可控；
   2. `Window.all()` 变成空列表 —— 窗口识别与锁边**完全失效**（没有任何高亮框），可截图像素是好的，所以"截图能用"推不出"模块加载成功"。
 
-  现在统一走 `loadNodeScreenshots.ts`，**同步**加载、进程级单例（成功/失败都只解析一次）：主进程 `require` → `createRequire(process.execPath)` 兜一次（非 Electron 环境也走这条），两条都失败就记下原因、**不抛在模块加载期**——顶层静态 `import 'node-screenshots'` 会让宿主 `require('@qs-coder/electron-screenshots')` 的那一刻直接崩掉，上面的降级路径也就全废了。`new Screenshots()` 里会先 `warmUpNodeScreenshots()` 预热一次，首次 `require` 的几毫秒落在宿主启动阶段而不是第一次截图；之后 `capture()` / `getWindows()` / `getMonitor()` 都只是同步取缓存。asar 内的 `.node` 由 Electron 的 `process.dlopen` 处理，不需要额外 `asarUnpack`。兜底路径也做了加固：取两次源、**丢掉第一帧**，并打一条 `抓屏退化到 desktopCapturer：…` 的警告 —— 真降级时日志里一眼能看见，不会再静默地变成"没有高亮 + 有残影"。
+  现在统一走 `loadNodeScreenshots.ts`，**同步**加载、进程级单例（成功/失败都只解析一次）：主进程 `require` → `createRequire(process.execPath)` 兜一次（非 Electron 环境也走这条），两条都失败就记下原因、**不抛在模块加载期**——顶层静态 `import 'node-screenshots'` 会让宿主 `require('@qs-coder/electron-screenshots')` 的那一刻直接崩掉，上面的降级路径也就全废了。`new Screenshots()` 里会先 `warmUpNodeScreenshots()` 预热一次，首次 `require` 的几毫秒落在宿主启动阶段而不是第一次截图；之后 `capture()` / `getWindows()` / `getMonitor()` 都只是同步取缓存。asar 内的 `.node` 由 Electron 的 `process.dlopen` 处理，不需要额外 `asarUnpack`。兜底路径也做了加固：取两次源、**丢掉第一帧**，并打一条 `抓屏退化到 desktopCapturer（原生后端不可用：…）：…` 的警告 —— 真降级时日志里一眼能看见，不会再静默地变成"没有高亮 + 有残影"。这条 try/catch 降级是 0.6.2 起就有的托底，在 0.6.2 上验证可用；前置门禁只是额外挡住"JS 根本接不住的 abort"，两者互补，不互相替代。
+
+- **UKUI Wayland 上必须在调原生 API 之前换后端**：麒麟 V10 SP1 / ARM64 的 UKUI Wayland 只提供 `zxdg_output_manager_v1` v2，而 `libwayshot 0.3.0` 要求 v3，且该桌面没有后续抓屏需要的 `zwlr_screencopy_manager_v1`。原生库在 `lib.rs:133:17` `panic!`，并且发生在不能 unwind 的回调里（`panic in a function that cannot unwind` → `SIGABRT`），**不是 JS 能 try/catch 的异常**。所以 `captureBackend: 'auto'` 在 Linux Wayland 会话下直接跳过 `node-screenshots` 的 require 与所有原生调用（包括 `Monitor.fromPoint` / `captureImage` / `Window.all`），走 Electron `desktopCapturer` 兜底；窗口识别随之不可用，拾取退化为元素边/手动框选。日志里会出现 `原生抓屏后端已禁用：UKUI Wayland …`。X11（含 XWayland 且显式 `--ozone-platform=x11`）、macOS、Windows 仍走原生后端；wlroots 合成器确认可用时传 `captureBackend: 'native'` 强制走原生。注意这条 Electron 兜底路径在 UKUI 上的实际成图效果仍需在故障机验证。
 
 - **点击到"画面锁住"的响应速度**：`startCapture` 按"先锁屏、再补数据"排列，顺序是 `capture(活动屏) ‖ 建窗口` → 建齐每块屏的遮罩（全透明，点击当场被吃掉）→ 截图窗口以 opacity 0 `show()` → 并行开始其他屏的预截（每块抓完像素就压暗那一块）→ 等渲染端画完这一帧 → opacity 1 亮出来。窗口枚举、元素识别都排在显示之后，所以从点击到画面静止的时间约等于 `captureImage + toPng`。
 
@@ -292,6 +294,11 @@ export interface ScreenshotsOpts {
   // 只在本轮第一次抓屏前等一次，且与建窗口并行，基本不增加"从点击到画面锁住"的耗时。
   // 传 0 关闭（宿主自己保证抓屏时窗口已不在画面上）
   captureSettleMs?: number;
+  // 抓屏后端：auto（默认）/ native / electron。auto 在 Linux Wayland 会话下禁用
+  // node-screenshots 原生后端，改走 Electron desktopCapturer（避免 libwayshot panic/abort）。
+  // 确认原生可用的 wlroots 合成器可显式传 native，或用环境变量
+  // ELECTRON_SCREENSHOTS_CAPTURE_BACKEND=native|electron|auto 覆盖。
+  captureBackend?: 'auto' | 'native' | 'electron';
 }
 ```
 
