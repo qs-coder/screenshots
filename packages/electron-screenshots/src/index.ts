@@ -1,6 +1,7 @@
 import Events from 'node:events';
 import debug, { type Debugger } from 'debug';
 import {
+  app,
   BrowserView,
   BrowserWindow,
   clipboard,
@@ -108,9 +109,22 @@ export interface ScreenshotsOpts {
    * 只在本轮**第一次**抓屏前等一次，而且这段时间和建窗口（`reset` 等渲染回执）
    * 是并行的，所以基本不增加"从点击到画面锁住"的耗时。
    *
-   * 传 0 关闭（宿主自己保证抓屏时窗口已经不在画面上）。
+   * 传 0 只关掉这段合成等待；macOS 上第一次抓屏仍会等光标锁（见 `hideCursor`），
+   * 通常几十到一两百毫秒，拿不到锁时最坏一秒多。
    */
   captureSettleMs?: number;
+  /**
+   * macOS 抓屏时临时把系统光标藏起来，默认 `true`（见 `lockCursorForCapture`）。
+   *
+   * 手段是「4×4 透明 helper 窗口 + pointer lock」，只在抓屏那一小段生效，代价是：
+   * - 若宿主不在前台，会 `app.focus({ steal: true })` 抢一次前台；
+   * - 这几百毫秒内指针位置被冻结，鼠标点击落在 helper 窗口上（不会传给别的应用）；
+   * - 会常驻一个隐藏窗口，直到应用退出才销毁。
+   *
+   * 不接受这些副作用（或自己做截图引导）就传 `false`：底图会像修复前一样带指针。
+   * Windows / Linux 的抓屏路径本来就不含指针，这个选项在那边是空操作。
+   */
+  hideCursor?: boolean;
   /**
    * 抓屏后端：`auto`（默认）/ `native` / `electron`。
    *
@@ -162,6 +176,75 @@ const FALLBACK_SECOND_GRAB_DELAY = 60;
  * 用户看到的就是"截图一出来任务栏没了"。现在只靠窗口层级盖住，系统状态一动不动。
  */
 const OVERLAY_LEVEL = 'screen-saver';
+
+/**
+ * 抓屏期间藏光标用的 helper 窗口尺寸（macOS）。
+ *
+ * 它只需要「能被聚焦、能拿到 pointer lock」，画面上什么都不用显示，所以做成
+ * 4×4 全透明：肉眼看不见，也不会在底图上留下任何像素。
+ *
+ * 尺寸必须**小于 `getWindows` 的 `MIN_WINDOW_SIZE`（8）**：万一窗口枚举那一刻它
+ * 还可见，8×8 就会变成一个凭空出现的可拾取候选（8×8 的高亮框/吸附目标），
+ * 而 `getWindows` 只排除铺满整屏的自有窗口，不会按 pid 把本进程的窗口一刀切。
+ */
+const CURSOR_LOCK_WIN_SIZE = 4;
+
+/**
+ * pointer lock 生效之后再等多久才允许抓屏。
+ *
+ * Chromium 拿到锁之后才去调 `CGDisplayHideCursor`，WindowServer 也要下一帧
+ * 才把它从合成里拿掉；抓早了指针照样在底图上。实测一帧（16ms）足够，这里就留一帧。
+ */
+const CURSOR_LOCK_SETTLE_MS = 16;
+
+/**
+ * 光标锁最长持有多久。
+ *
+ * 正常路径是"所有屏的像素（含稳定校正）都到手就放锁"，最多几百毫秒，所以这个
+ * 上限只防"抓屏卡死"把用户的鼠标一直锁着 —— 那时宁可这张图带指针。
+ *
+ * 必须盖住最慢的那条路径：settle 50 + 拿锁 ~100 + 校正 2×80ms 间隔 + 3 次
+ * `captureImage`（5K 屏实测单次可到 500ms）。按 2s 卡，慢机 + 多屏时会在校正
+ * 半路上放锁，而**最后那几拍才是真正进底图的**，等于白藏。
+ */
+const CURSOR_LOCK_TIMEOUT_MS = 4_000;
+
+/** `setTimeout` 的 Promise 版（只有新增的藏光标代码用它，别处的内联写法保持原样） */
+const delay = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * 藏光标用的空白页。全透明、无滚动条，页面上什么都不放。
+ */
+const CURSOR_LOCK_HTML =
+  '<!DOCTYPE html><html><head><meta charset="utf-8"><style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:transparent}</style></head><body></body></html>';
+
+/**
+ * 申请 pointer lock 的页面脚本。
+ *
+ * `requestPointerLock()` 在新版 Chromium 上返回 Promise，旧版返回 undefined，
+ * 两种都认；结果统一成 `'ok'` / `'nofocus'` / `'error:...'` 三个字符串，
+ * 不把异常抛回主进程。
+ */
+const CURSOR_LOCK_SCRIPT = `(async () => {
+  try {
+    // 先等文档拿到焦点：窗口 show 出来到真的成为 key window 之间有一小段，
+    // 这期间 requestPointerLock 会以 WrongDocumentError 拒绝
+    for (let i = 0; i < 25 && !document.hasFocus(); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 8));
+    }
+    if (!document.hasFocus()) {
+      return 'nofocus';
+    }
+    const ret = document.body.requestPointerLock();
+    if (ret && typeof ret.then === 'function') {
+      await ret;
+    }
+    return document.pointerLockElement !== null ? 'ok' : 'nofocus';
+  } catch (err) {
+    return 'error:' + ((err && err.name) || '');
+  }
+})()`;
 
 /**
  * 抓屏前默认等多久，见 `ScreenshotsOpts.captureSettleMs`。
@@ -398,6 +481,36 @@ export default class Screenshots extends Events {
   private escRegistered = false;
 
   /**
+   * 藏光标用的 helper 窗口（macOS，见 `lockCursorForCapture`）。
+   *
+   * 懒创建、之后一直复用：它只有 4×4、全透明、隐藏着，创建一次几十毫秒，
+   * 每轮重建就是白白拖慢"从点击到画面锁住"（应用退出时才销毁，见
+   * `ensureCursorLockWindow`）。
+   */
+  private $cursorLockWin: BrowserWindow | null = null;
+
+  /** helper 窗口的页面加载 Promise：拿锁之前要等它（见 `lockCursorForCapture`） */
+  private $cursorLockReady: Promise<void> | null = null;
+
+  /** pointer lock 当前是否握在本库手里（也就是系统光标此刻是藏着的） */
+  private cursorLocked = false;
+
+  /** 本轮发起的光标锁任务；`settleBeforeGrab` 要等它落地才允许抓第一拍 */
+  private cursorLockTask: Promise<void> | null = null;
+
+  /**
+   * 光标锁代次。`unlockCursor` 会 +1，让还在半路上的 lock 任务作废 ——
+   * 截图失败回滚/超时放锁之后，那次 `executeJavaScript` 才返回也不能再把锁拿回去。
+   */
+  private cursorLockSeq = 0;
+
+  /** 光标锁的兜底放锁定时器（见 `CURSOR_LOCK_TIMEOUT_MS`） */
+  private cursorLockTimer: NodeJS.Timeout | null = null;
+
+  /** 是否在抓屏那一小段藏起系统光标（macOS，见 `ScreenshotsOpts.hideCursor`） */
+  private hideCursor = true;
+
+  /**
    * 每块屏的「冻结画面」窗口，key 为 display.id。
    *
    * 它不是遮罩，而是**这块屏自己的那张截图**（外加和活动屏同 alpha 的压暗）。
@@ -503,6 +616,7 @@ export default class Screenshots extends Events {
     this.isDetectEdges = opts?.detectEdges || false;
     this.edgeThresholds = opts?.edgeThresholds;
     this.captureSettleMs = opts?.captureSettleMs ?? CAPTURE_SETTLE_MS;
+    this.hideCursor = opts?.hideCursor ?? true;
     /**
      * 后端选择必须早于原生模块预热：UKUI Wayland 上原生库能加载，但一调用就 abort。
      * `auto` 判定为 Electron 后端时，`warmUpNodeScreenshots()` 只记原因、不 require。
@@ -772,6 +886,8 @@ export default class Screenshots extends Events {
   private abortStart(reason: unknown): void {
     this.logger('startCapture 失败，回滚覆盖层 %o', reason);
     this.capturing = false;
+    // 失败也要把光标还回去：否则用户面前是一个"鼠标不见了"的系统
+    this.unlockCursor();
     this.captureReady = false;
     this.settlePromise = null;
     this.settleFirst = true;
@@ -977,11 +1093,46 @@ export default class Screenshots extends Events {
      * 串行抓的话从第二块屏开始必然带点；同时开抓才能让每块屏都拿到不带点的那一帧。
      * （微信的截图里没有这个点，就是因为它一轮只抓一次、都挤在同一个"冷"窗口里。）
      */
-    const pendingShots = this.grabAllDisplays(display);
+    /**
+     * macOS 上先把系统光标藏起来（见 `lockCursorForCapture`）：抓屏走的是
+     * `CGWindowListCreateImage`，不藏的话底图上会带着鼠标指针。
+     *
+     * 这里只**发起**、不 await：建 helper 窗口 + 拿 pointer lock 和下面的 settle
+     * 并行跑，`settleBeforeGrab` 里两个一起等，所以几乎不额外拖慢第一拍。
+     */
+    this.cursorLockTask = this.lockCursorForCapture();
+    const lockTask = this.cursorLockTask;
+
+    const { pending: pendingShots, grabbed } = this.grabAllDisplays(display);
     const shotPromise = pendingShots.get(display.id) as Promise<Shot>;
     // 这里只是先挂一个处理者：截图失败时下面等渲染端的这段时间不会变成
     // unhandledRejection；错误本身仍由 Promise.all 抛给调用方
     shotPromise.catch(() => {});
+
+    /**
+     * 所有屏的**像素**（含各自的稳定校正）都到手就放锁，不等编码。
+     *
+     * 不能只等活动屏：稳定校正会接着重抓好几张，最后那张才是底图，提前放锁等于白藏。
+     * 也不能等 `allSettled`：那一批 Promise 里含着 `toPng`（5K 屏几百毫秒），
+     * 锁的唯一用途只是让抓屏拍不到指针，编码期间让用户看不见鼠标纯属副作用。
+     */
+    void grabbed.then(() => {
+      // 只放**这一轮**的锁：这期间用户可能已经取消并开了下一轮，
+      // 那一下会拿到新的 cursorLockTask，这里再 unlock 就把人家的锁放掉了
+      if (this.cursorLockTask === lockTask) {
+        this.unlockCursor();
+      }
+    });
+    /**
+     * 兜底：`capture()` 保证每条路径都恰好触发一次 `grab()`（成功在 `toPng` 前、
+     * 失败在落到兜底路径前），但万一它被 reject 在外层、`grabbed` 永远不 resolve，
+     * 就靠这里放锁，不至于一直锁到 4s 的兜底超时。
+     */
+    void Promise.allSettled([...pendingShots.values()]).then(() => {
+      if (this.cursorLockTask === lockTask) {
+        this.unlockCursor();
+      }
+    });
 
     /**
      * 顺序是这一轮的关键，**先建窗口 → 再等底图 → 立刻显示 → 最后等渲染端**。
@@ -1116,8 +1267,14 @@ export default class Screenshots extends Events {
    * 返回值按 display.id 索引：活动屏那一条给 `startCapture` 的后续流程用，
    * 其余的在 `captureOtherDisplays` 里消费。失败先在这里接住（不吞错误，只是不让它
    * 变成 unhandledRejection），真正的处理仍在各自的调用点。
+   *
+   * 另外给一条 `grabbed`：所有屏的**最终像素**都到手（含稳定校正、不含 `toPng`）
+   * 时 resolve，用来尽早放掉光标锁 —— 见 `startCapture` 里的说明。
    */
-  private grabAllDisplays(active: Display): Map<number, Promise<Shot>> {
+  private grabAllDisplays(active: Display): {
+    pending: Map<number, Promise<Shot>>;
+    grabbed: Promise<void>;
+  } {
     const pending = new Map<number, Promise<Shot>>();
     const targets: Display[] = [active];
     for (const item of screen.getAllDisplays()) {
@@ -1126,8 +1283,24 @@ export default class Screenshots extends Events {
       }
     }
 
+    let remaining = targets.length;
+    let release!: () => void;
+    const grabbed = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    /**
+     * `capture()` 的每条路径都恰好调一次 `onGrabbed`：成功在 `toPng` 之前，
+     * 抛错在落到 `desktopCapturer` 兜底之前，所以这个计数一定会归零。
+     */
+    const onGrabbed = () => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        release();
+      }
+    };
+
     for (const display of targets) {
-      const promise = this.capture(display);
+      const promise = this.capture(display, onGrabbed);
       promise.catch(() => {});
       pending.set(display.id, promise);
     }
@@ -1137,7 +1310,7 @@ export default class Screenshots extends Events {
       targets.length,
       targets.map((item) => item.id),
     );
-    return pending;
+    return { pending, grabbed };
   }
 
   /**
@@ -1163,7 +1336,8 @@ export default class Screenshots extends Events {
           const display = toDisplay(item);
           try {
             // 抓屏已经同时发出去了，这里只等它落地；没有预发（新插进来的屏）才现场截
-            const shot = await (pending.get(display.id) ?? this.capture(display));
+            const shot = await (pending.get(display.id) ??
+              this.capture(display));
             // 期间截图可能已经结束，缓存留着没用还占内存
             if (!this.capturing) {
               return;
@@ -1524,6 +1698,8 @@ export default class Screenshots extends Events {
     this.logger('endCapture');
     // 先停置顶守卫，否则它会一边拆窗口一边把窗口重新抬起来
     this.stopTopMostGuard();
+    // 收尾一定要把光标还回去（正常路径第一波抓完就放了，这里只是兜底）
+    this.unlockCursor();
     // 会话已经结束，ESC 立刻失效：晚一步的话，收尾这几百毫秒里按 ESC
     // 会再走一遍 cancel → endCapture，把宿主的回调打两次
     this.captureReady = false;
@@ -1792,6 +1968,28 @@ export default class Screenshots extends Events {
   }
 
   /**
+   * 保存对话框期间，把整层截图 UI 从 `OVERLAY_LEVEL` 放下来给弹窗让位。
+   *
+   * `showSaveDialog` 是挂在截图窗口上的 sheet，层级跟着父窗口走。旧代码只降截图
+   * 窗口，冻结画面却仍停在 `screen-saver`，而它盖满整屏 —— 用户看到的就是那张
+   * 压暗的定格图，原生保存对话框被压在底下。
+   *
+   * 顺序也有讲究：先降冻结画面，最后降截图窗口并 `moveTop()`，保证同层级里
+   * 截图窗口（连同它的 sheet）仍在冻结画面之上。关掉弹窗后用 `raiseAll()` 还原。
+   */
+  private suspendTopMostForDialog(): void {
+    for (const item of this.$freezeWins.values()) {
+      if (!item.$win.isDestroyed()) {
+        item.$win.setAlwaysOnTop(false);
+      }
+    }
+    if (this.$win && !this.$win.isDestroyed()) {
+      this.$win.setAlwaysOnTop(false);
+      this.$win.moveTop();
+    }
+  }
+
+  /**
    * 截图期间的置顶守卫。
    *
    * 别的应用可能随时把自己的浮层提到最前（提示气泡、录屏指示器、输入法候选框），
@@ -1807,7 +2005,26 @@ export default class Screenshots extends Events {
       if (!this.capturing || this.isDialogOpen) {
         return;
       }
-      this.raiseAll();
+      const $win = this.$win;
+      /**
+       * 只在截图窗口**确实不在最前面**时才动层级，别再每拍无条件 `raiseAll()`。
+       *
+       * 旧代码每 400ms 对所有冻结窗 + 截图窗口重设一次 `setAlwaysOnTop(true,
+       * 'screen-saver')` 并 `moveTop()`。Windows 的 DWM 对透明顶层窗
+       * （`transparent: true`）每次重设层级都要重排 Z-order、整窗重新合成，
+       * 于是一张本来静止的截图会周期性闪一帧 —— 用户 hover 自动选窗时看着就是
+       * "高亮框和画面时不时地闪"。窗口一多（每屏一个冻结窗）闪得更明显。
+       * macOS 上反复抬同一批窗口同样没必要，还可能把渲染端判成 occluded。
+       *
+       * 真正被别的窗口抢走层级/焦点时，`$win.on('blur')` 已经会立刻 `raiseAll()`
+       * + `focus()` 抢回来（见 ensureWindow），不需要这里每拍兜底。焦点还在自己
+       * 身上就说明没被盖住，这一拍只做下面的 ESC 自愈，不碰任何窗口层级。
+       */
+      if ($win && !$win.isDestroyed() && !$win.isFocused()) {
+        this.logger('置顶守卫：截图窗口失焦，重新置顶');
+        this.raiseAll();
+        $win.focus();
+      }
       /**
        * ESC 自愈。按旧文档接入的宿主会在截图窗 `blur` 时自己
        * `globalShortcut.unregister('esc')` —— 同一个应用、同一个键，那一下会把
@@ -1962,9 +2179,10 @@ export default class Screenshots extends Events {
       // 一旦被别的窗口盖住，用户就能看到真实桌面、也能点到底下的应用
       $win.setAlwaysOnTop(true, OVERLAY_LEVEL);
 
-      // 它必须可聚焦光标才会更新，所以一拿到焦点就立刻还给截图窗口
+      // 它必须可聚焦光标才会更新，所以一拿到焦点就立刻还给截图窗口。
+      // 保存对话框期间不能抢焦点，否则会把对话框的键盘输入（含文件名）抢走
       $win.on('focus', () => {
-        if (this.capturing) {
+        if (this.capturing && !this.isDialogOpen) {
           this.$win?.focus();
         }
       });
@@ -2027,7 +2245,13 @@ export default class Screenshots extends Events {
    *
    * 只动页面里的一个类，窗口本身常驻 —— 换屏路径上不再有窗口的创建销毁。
    *
-   * 显示用 `show()` 而不是 `setOpacity`：透明窗口在 Windows 上对 setOpacity
+   * 显示用 `showInactive()` 而不是 `show()`：**冻结画面绝不能抢焦点**。
+   * pointer lock 会随窗口失焦被 Chromium 立刻放掉（规范要求），而这块屏的像素
+   * 可能还没抓完（异速多屏：1080p 先好、5K 还在校正），一抢焦点光标就回来了，
+   * 后面那几拍校正重抓到的底图就带指针（见 `assertCursorLocked`）。
+   * 它纯粹是视觉层，本来也不需要成为 key window。
+   *
+   * 也不用 `setOpacity(0)` 那套隐身：透明窗口在 Windows 上对 setOpacity
    * 支持不可靠，一旦没生效就是"整块屏永远不压暗"。
    */
   private setFreezeVeil(displayId: number, on: boolean): void {
@@ -2038,7 +2262,7 @@ export default class Screenshots extends Events {
     item.veil = on;
     if (on && !item.shown) {
       item.shown = true;
-      item.$win.show();
+      item.$win.showInactive();
       // 上屏后再落一次 bounds：macOS 的 frame 夹取可能发生在第一次上屏时，
       // 而 `enableLargerThanScreen` 下这次 setBounds 才真正盖满整屏
       if (process.platform === 'darwin') {
@@ -2101,6 +2325,324 @@ export default class Screenshots extends Events {
   }
 
   /**
+   * 抓屏前把**系统光标**藏起来（macOS）。
+   *
+   * 为什么要藏：macOS 上 `node-screenshots`（xcap 0.4.1）抓的是合成后的屏幕画面，
+   * 会把鼠标指针一起写进底图 —— 实测 macOS 26 上抓出来的 PNG 里就是一根黑箭头，
+   * 而系统截图、微信/Snipaste 这些工具都不带指针。
+   * `desktopCapturer` 那条兜底路确实不拍指针，但它慢一倍、拿不到 RGBA（窗口识别会退化），
+   * 不能为了去掉指针整体换回去，所以只在抓屏这一小段里把指针藏掉。
+   *
+   * 手段是 Chromium 的 **pointer lock**：锁住指针时浏览器会调 `CGDisplayHideCursor`，
+   * 指针就不在 WindowServer 的合成里了，之后抓屏自然拍不到它（实测：锁住期间抓的底图
+   * 没有指针，解锁后同一位置又出现）。不需要任何原生模块、也不改底图像素。
+   *
+   * 两个前提，都在这里处理：
+   * - **文档要聚焦**：从全局快捷键/后台触发时应用可能不在前台，`requestPointerLock`
+   *   会以 `WrongDocumentError` 拒绝，所以先 `app.focus({ steal: true })`；
+   * - **需要用户手势**：`executeJavaScript(code, true)` 伪造一次，否则同样会被拒。
+   *
+   * 锁在 `settleBeforeGrab` 里和 settle 一起等（两者并行）；放锁由调用方负责 ——
+   * 所有屏的像素（含稳定校正）都到手就 `unlockCursor`，不等 `toPng` 编码。
+   * 失败只记日志、不阻断截图 —— 最坏结果就是这一张图里带指针，和修之前一样。
+   */
+  private async lockCursorForCapture(): Promise<void> {
+    if (!this.hideCursor || process.platform !== 'darwin') {
+      return;
+    }
+    if (this.cursorLocked) {
+      return;
+    }
+    const seq = ++this.cursorLockSeq;
+    const startedAt = performance.now();
+    try {
+      const $win = this.ensureCursorLockWindow();
+      if (!$win || $win.isDestroyed() || $win.webContents.isDestroyed()) {
+        return;
+      }
+      /**
+       * 第一轮是"边加载页面边拿锁"：等页面起来，但绝不能被一个卡死的渲染端拖住。
+       *
+       * 600ms 是给冷启动留的余量：页面还没加载完时脚本会锁在 `about:blank` 上，
+       * 而 `loadURL` 一提交、文档被换掉，锁跟着失效（见下面的二次校验）。
+       */
+      await Promise.race([
+        this.$cursorLockReady ?? Promise.resolve(),
+        delay(600),
+      ]);
+      if (seq !== this.cursorLockSeq || $win.isDestroyed()) {
+        return;
+      }
+      /**
+       * pointer lock 只认"当前聚焦的文档"：从后台/全局快捷键触发时先把应用抬到前台。
+       * 已经在前台就别再 focus 了 —— 实测这一下要几十毫秒，而绝大多数截图都是从
+       * 应用自己的界面/全局快捷键起来的。
+       */
+      if (!BrowserWindow.getFocusedWindow()) {
+        app.focus({ steal: true });
+      }
+      $win.show();
+      $win.focus();
+      $win.webContents.focus();
+      /**
+       * 拿锁脚本自带「等文档聚焦」和超时（见 CURSOR_LOCK_SCRIPT），主进程只负责超时兜底：
+       * `executeJavaScript` 本身没有超时，渲染端一旦卡死这个 Promise 会一直挂着，
+       * 而 `settleBeforeGrab` 正等着它 —— 整次截图就停在"点了没反应"。
+       */
+      const requestLock = () =>
+        Promise.race([
+          $win.webContents
+            .executeJavaScript(CURSOR_LOCK_SCRIPT, true)
+            .catch((err: unknown) => `error:${String(err)}`),
+          new Promise<string>((resolve) =>
+            setTimeout(() => resolve('timeout'), 400),
+          ),
+        ]);
+      let result = await requestLock();
+      if (result === 'nofocus') {
+        // 从后台起来/被别的应用抢了焦点：强制抢一次前台再试
+        app.focus({ steal: true });
+        $win.focus();
+        $win.webContents.focus();
+        result = await requestLock();
+      }
+      // 等脚本执行完的工夫里已经回滚/放锁了：这次结果作废，别把锁又拿回去
+      if (seq !== this.cursorLockSeq) {
+        return;
+      }
+      if (result !== 'ok') {
+        this.logger('藏光标失败（%s）：本轮底图可能带鼠标指针', result);
+        /**
+         * 只隐藏窗口就够把"迟到的锁"挡在门外：窗口一隐藏，文档就失去焦点，
+         * 超时那一次 `requestPointerLock` 只会被拒（脚本自己还会先查 `hasFocus`），
+         * 拿不上锁，也就不会留下"藏起来再也放不掉"的光标。所以不必再排清扫定时器。
+         */
+        this.unlockCursor();
+        return;
+      }
+      // 拿到锁只是"开始隐藏"，合成器落下来还要一帧；这期间抓屏仍会拍到指针
+      await delay(CURSOR_LOCK_SETTLE_MS);
+      if (seq !== this.cursorLockSeq) {
+        return;
+      }
+      /**
+       * 再问一次锁还在不在：上面那次 `'ok'` 有可能锁在 `about:blank` 上，而
+       * `loadURL` 一提交文档就被换掉、锁随之失效。问不出来（渲染端卡住）按还在处理，
+       * 真丢了的话抓屏前的 `assertCursorLocked` 还会再兜一次。
+       */
+      if ((await this.queryPointerLock($win)) === false) {
+        this.logger('藏光标失败（拿锁后已失效）：本轮底图可能带鼠标指针');
+        this.unlockCursor();
+        return;
+      }
+      if (seq !== this.cursorLockSeq) {
+        return;
+      }
+      this.cursorLocked = true;
+      this.logger(
+        '藏光标：pointer lock 生效 +%dms',
+        Math.round(performance.now() - startedAt),
+      );
+      this.cursorLockTimer = setTimeout(() => {
+        this.logger('藏光标超时，兜底放锁');
+        this.unlockCursor();
+      }, CURSOR_LOCK_TIMEOUT_MS);
+    } catch (err) {
+      this.logger('藏光标失败（不影响截图）：%o', err);
+      this.unlockCursor();
+    }
+  }
+
+  /**
+   * 问渲染端「pointer lock 还在不在」：`true` / `false`，问不出来（渲染端卡死、
+   * 窗口已销毁）回 `null` —— 调用方自己决定拿不到答案时怎么处理。
+   *
+   * 150ms 超时是必须的：`executeJavaScript` 没有自带超时，渲染端一卡，
+   * 这个 Promise 就永远挂着，而它会被抓屏和放锁路径 await。
+   */
+  private async queryPointerLock($win: BrowserWindow): Promise<boolean | null> {
+    if ($win.isDestroyed() || $win.webContents.isDestroyed()) {
+      return null;
+    }
+    try {
+      return await Promise.race([
+        $win.webContents.executeJavaScript(
+          'document.pointerLockElement !== null',
+          true,
+        ),
+        new Promise<boolean | null>((resolve) =>
+          setTimeout(() => resolve(null), 150),
+        ),
+      ]);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 抓屏前确认「系统光标此刻真的是藏着的」。
+   *
+   * pointer lock 会随窗口失焦被 Chromium 立刻放掉（规范要求：窗口/标签失焦即退出），
+   * 而抓屏流程里又必须显示截图窗口去拿键盘焦点 —— 这两件事天然打架。所以不能靠
+   * "本轮发起过锁"推断"现在锁着"，每拍抓屏前问一次渲染端（约 1~3ms）。
+   *
+   * 只做诊断与降级：锁没了照常抓（最坏就是这张图带指针，和修复前一致），
+   * 但必须留一条日志 —— 否则"图里为什么有鼠标"永远查不出来。
+   */
+  private async assertCursorLocked(label: string): Promise<void> {
+    if (process.platform !== 'darwin' || !this.cursorLocked) {
+      return;
+    }
+    const $win = this.$cursorLockWin;
+    if (!$win || $win.isDestroyed() || $win.webContents.isDestroyed()) {
+      // 窗口没了，锁一定也没了；本轮剩下的拍都按"带指针"处理
+      this.cursorLocked = false;
+      this.logger('藏光标已失效（%s）：helper 窗口已销毁', label);
+      return;
+    }
+    if ((await this.queryPointerLock($win)) === false) {
+      // 丢掉之后不再重复检查、也不再重复打日志：本轮就这一张图带指针
+      this.cursorLocked = false;
+      this.logger('藏光标已失效（%s）：这张底图可能带鼠标指针', label);
+    }
+  }
+
+  /**
+   * 放掉光标锁，把系统光标还回去。
+   *
+   * 幂等：截图失败回滚、超时兜底、正常收尾都会调，重复调只是再隐藏一次 helper 窗口。
+   * **必须先 `exitPointerLock` 再隐藏窗口**：只隐藏窗口的话 Chromium 不一定会补
+   * `CGDisplayShowCursor`，光标就一直是藏着的（用户看到的是"鼠标没了"）。
+   * 所以这里等脚本回执再 hide，另留一个 300ms 兜底 —— 渲染端卡死也得把指针还回去。
+   */
+  private unlockCursor(): void {
+    // 让还在半路上的 lock 任务作废（见 cursorLockSeq）
+    this.cursorLockSeq++;
+    if (this.cursorLockTimer) {
+      clearTimeout(this.cursorLockTimer);
+      this.cursorLockTimer = null;
+    }
+    this.cursorLockTask = null;
+    this.cursorLocked = false;
+    const $win = this.$cursorLockWin;
+    if (!$win || $win.isDestroyed() || $win.webContents.isDestroyed()) {
+      return;
+    }
+    const hide = () => {
+      /**
+       * 新一轮可能已经把这个 helper 窗口重新 show 出来并拿上了锁（用户取消后立刻
+       * 又按了截图）：这时 hide 会把它藏掉、连带废掉新锁，所以先看锁还在不在。
+       */
+      if (this.cursorLocked || this.cursorLockTask) {
+        return;
+      }
+      if (!$win.isDestroyed()) {
+        $win.hide();
+      }
+    };
+    const timer = setTimeout(hide, 300);
+    void $win.webContents
+      .executeJavaScript(
+        'document.exitPointerLock && document.exitPointerLock()',
+        true,
+      )
+      .then(
+        () => {
+          clearTimeout(timer);
+          hide();
+        },
+        () => {
+          clearTimeout(timer);
+          hide();
+        },
+      );
+  }
+
+  /**
+   * 懒创建藏光标用的 helper 窗口。
+   *
+   * 4×4、全透明、无阴影、不上任务栏：它只需要能聚焦，画面上什么都不能留下。
+   * 位置跟着光标所在屏走，保证 show 出来就在当前这块屏上（跨屏时不至于跑到别的 Space）。
+   */
+  private ensureCursorLockWindow(): BrowserWindow | null {
+    const existing = this.$cursorLockWin;
+    if (existing && !existing.isDestroyed()) {
+      const display = getDisplay();
+      existing.setBounds({
+        x: display.x + 60,
+        y: display.y + 60,
+        width: CURSOR_LOCK_WIN_SIZE,
+        height: CURSOR_LOCK_WIN_SIZE,
+      });
+      return existing;
+    }
+
+    const display = getDisplay();
+    const $win = new BrowserWindow({
+      title: 'screenshots-cursor-lock',
+      x: display.x + 60,
+      y: display.y + 60,
+      width: CURSOR_LOCK_WIN_SIZE,
+      height: CURSOR_LOCK_WIN_SIZE,
+      show: false,
+      frame: false,
+      transparent: true,
+      backgroundColor: '#00000000',
+      hasShadow: false,
+      resizable: false,
+      movable: false,
+      minimizable: false,
+      maximizable: false,
+      fullscreenable: false,
+      skipTaskbar: true,
+      focusable: true,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        // 它整场都在等"被聚焦 → 拿锁"，被当成后台页面节流就晚了
+        backgroundThrottling: false,
+      },
+    });
+    this.$cursorLockWin = $win;
+    /**
+     * 这个窗口整场只建一次，但**必须随应用退出销毁**：它常驻会让
+     * `window-all-closed` 永远不触发（宿主"关掉最后一个窗口就退出"的逻辑失效），
+     * `BrowserWindow.getAllWindows()` 也会凭空多出一个 4×4 的窗口。
+     */
+    const onQuit = () => {
+      if (!$win.isDestroyed()) {
+        $win.destroy();
+      }
+    };
+    app.on('before-quit', onQuit);
+    $win.on('closed', () => {
+      app.removeListener('before-quit', onQuit);
+      if (this.$cursorLockWin === $win) {
+        this.$cursorLockWin = null;
+        this.$cursorLockReady = null;
+      }
+    });
+    if (process.platform !== 'win32') {
+      // 宿主全屏（另一个 Space）时也要能 show 出来，否则拿不到 pointer lock；
+      // skipTransformProcessType 防止把整个应用变成 accessory
+      $win.setVisibleOnAllWorkspaces(true, {
+        visibleOnFullScreen: true,
+        skipTransformProcessType: true,
+      });
+    }
+    // 记下加载 Promise：第一轮拿锁时页面可能还没起来（executeJavaScript 会失败）
+    this.$cursorLockReady = $win
+      .loadURL(
+        `data:text/html;charset=utf-8,${encodeURIComponent(CURSOR_LOCK_HTML)}`,
+      )
+      .then(
+        () => undefined,
+        () => undefined,
+      );
+    return $win;
+  }
+
+  /**
    * 抓屏前等一拍，把"宿主刚 hide 掉自己窗口"这件事让合成器做完。
    *
    * 防截屏模式下宿主的调用顺序永远是 `mainWindow.hide()` → `startCapture()`，
@@ -2122,7 +2664,17 @@ export default class Screenshots extends Events {
     // 第一波（grabAllDisplays 同一 tick 里发出的所有抓屏）都算"第一次"：
     // 它们等的是同一个共享 Promise，之后各自做自己的稳定校正
     const first = this.settleFirst;
+    /**
+     * 藏光标（macOS）和 settle **并行**等，两个都落地才允许抓第一拍。
+     *
+     * 只等 settle 的话，pointer lock 还没生效就先抓了 —— 底图照样带指针；
+     * 串行等又白白多花几十毫秒，而这两件事本来互不依赖。
+     */
+    const lock = this.cursorLockTask;
     if (this.captureSettleMs <= 0) {
+      if (lock) {
+        await lock;
+      }
       this.settleFirst = false;
       return false;
     }
@@ -2138,7 +2690,7 @@ export default class Screenshots extends Events {
         );
       });
     }
-    await this.settlePromise;
+    await Promise.all([this.settlePromise, lock ?? Promise.resolve()]);
     this.settleFirst = false;
     return first;
   }
@@ -2167,9 +2719,9 @@ export default class Screenshots extends Events {
     let current = first;
 
     for (let round = 1; round < GRAB_MAX_ROUNDS; round++) {
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, GRAB_STABLE_GAP_MS);
-      });
+      await delay(GRAB_STABLE_GAP_MS);
+      // 这一拍才是最后进底图的那张，抓之前确认光标还藏着
+      await this.assertCursorLocked(`校正第 ${round} 拍`);
 
       let next: ShotImage;
       try {
@@ -2261,6 +2813,15 @@ export default class Screenshots extends Events {
         throw new Error(`Monitor.fromDisplay(${display.id}) get null`);
       }
 
+      /**
+       * 抓屏前确认光标此刻真的藏着。
+       *
+       * 不能靠"本轮发起过锁"推断：pointer lock 会随 helper 窗口失焦被 Chromium
+       * 立刻放掉，而流程里又要显示截图窗口去拿键盘焦点。问一次渲染端只要几毫秒，
+       * 代价远小于一张带鼠标的底图（见 `assertCursorLocked`）。
+       */
+      await this.assertCursorLocked('第一拍');
+
       let image = await monitor.captureImage();
       // 只有"本轮第一次"才做稳定校正：后面那些（其他屏预截、换屏补截）抓的时候
       // 宿主窗口早就没了，多抓只是白花时间
@@ -2284,7 +2845,10 @@ export default class Screenshots extends Events {
        */
       const stripStart = performance.now();
       let buffer = rawPng;
-      if (process.platform === 'darwin' && hasIndicatorCandidate(image, display.scaleFactor)) {
+      if (
+        process.platform === 'darwin' &&
+        hasIndicatorCandidate(image, display.scaleFactor)
+      ) {
         buffer = stripRecordingIndicator(rawPng, display.scaleFactor);
       }
       const stripCost = Math.round(performance.now() - stripStart);
@@ -2836,7 +3400,8 @@ export default class Screenshots extends Events {
         this.isDialogOpen = true;
         // 对话框开着的时候 ESC 必须留给对话框自己，否则用户按 ESC 关不掉它
         this.unregisterEscShortcut();
-        this.$win.setAlwaysOnTop(false);
+        // 冻结画面和截图窗口同在最高层级，必须一起让位，否则弹窗会被盖住
+        this.suspendTopMostForDialog();
 
         const { canceled, filePath } = await dialog
           .showSaveDialog(this.$win, {
@@ -2848,6 +3413,14 @@ export default class Screenshots extends Events {
           })
           .finally(() => {
             this.isDialogOpen = false;
+            /**
+             * 弹窗已关，把截图窗口和所有冻结画面按正确顺序抬回最上层。
+             *
+             * 放在 finally 里而不是 `await` 之后：`showSaveDialog` 抛错时也要还原，
+             * 否则整层截图 UI 停在普通层级（置顶守卫 400ms 后会自愈，但没必要让
+             * 用户先看一眼"截图掉到别人窗口底下"）。
+             */
+            this.raiseAll();
             // 对话框关了、截图还开着：把 ESC 还回来
             if (this.captureReady) {
               this.registerEscShortcut();
@@ -2859,7 +3432,6 @@ export default class Screenshots extends Events {
           return;
         }
 
-        this.assertTopMost(this.$win);
         if (canceled || !filePath) {
           this.emit('afterSave', new Event(), buffer, data, false); // isSaved = false
           return;

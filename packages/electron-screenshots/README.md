@@ -187,7 +187,7 @@ const screenshots = new Screenshots({
 
   **它绕不过系统权限**：macOS 未授予屏幕录制时，截图像素本身就只有壁纸和菜单栏（其他应用的内容连画面都被系统抹掉了），像素识别能检出的只是壁纸碎块。所以这个选项是给"窗口数据不够细"或"平台拿不到窗口几何"（Wayland）的场合补元素级拾取用的。渲染端要把 `edges` 传给 `<Screenshots>`，见 `@qs-coder/react-screenshots` 的文档。
 
-- 截图期间，截图窗口和所有遮罩都用 `screen-saver` 置顶层级，并有一个 400ms 的**置顶守卫**周期性把它们抬回最上面（截图窗口最后抬，保证它在遮罩之上）。失焦或被最小化时也立刻抬回并抢回焦点。保存对话框期间守卫会豁免——对话框挂在截图窗口上，压在最上面会把用户要点的那颗按钮盖住。
+- 截图期间，截图窗口和所有遮罩都用 `screen-saver` 置顶层级，并有一个 400ms 的**置顶守卫**周期性把它们抬回最上面（截图窗口最后抬，保证它在遮罩之上）。失焦或被最小化时也立刻抬回并抢回焦点。保存对话框期间守卫会豁免——对话框挂在截图窗口上，压在最上面会把用户要点的那颗按钮盖住；同时冻结画面和截图窗口会临时从 `screen-saver` 降下来给 sheet 让位（只降截图窗口的话，铺满整屏的定格图照样会把原生对话框压在底下），关掉后再按"冻结画面先、截图窗口后"的顺序一起抬回去。
 
   这从"只有 Windows"扩展到了**所有平台**。Windows 上是因为任务栏自身是 topmost 窗口，`setAlwaysOnTop(true)` 默认的 `floating` 层级排在任务栏**之下**，点一下任务栏截图界面就会沉底，加上 `skipTaskbar` 之后没有任何入口可以点回来，看起来像"截图丢了"。macOS 上 `floating` 同样压不住各种常驻浮层（录屏指示器、输入法候选框、各种 HUD），被盖住时用户看到的是一半截图、一半别人的界面。注意 `Win+D`、`Alt+Tab` 这类系统快捷键无法拦截，只能在失焦后抢回焦点。
 
@@ -197,9 +197,13 @@ const screenshots = new Screenshots({
 
   两者是**两件事**：层级只决定"谁在上面"，不会把系统那两条藏起来。想藏起来只能靠 kiosk/全屏，而那个副作用正是要避免的。冻结画面同理：三个平台都在上屏后补一次 `setBounds`（macOS 的 frame 夹取可能发生在第一次上屏时，`enableLargerThanScreen` 下这次 `setBounds` 才真正盖满整屏；Windows 是尺寸夹取；Linux 多调一次无副作用），并且它和截图窗口同在 `screen-saver` 层级 —— 谁后抬谁在上面，所以抬升顺序里截图窗口必须在最后，否则冻结画面会压住活动屏的截图窗口，macOS 判它 occluded、渲染端被节流（rAF 停、定时器拖到 1s），换屏就开始"追不上光标"。
 
+- **macOS 抓屏不再带系统光标**：`node-screenshots`（xcap 0.4.1）在 macOS 上抓的是合成后的屏幕画面，会把鼠标指针一起写进底图 —— 实测 macOS 26 上导出的 PNG 里就是一根黑箭头，而系统截图、微信/Snipaste 这些工具都不带。这里**不换抓屏后端**（`desktopCapturer` 不含指针，但慢一倍、还拿不到 RGBA），改用 Chromium 的 **pointer lock** 在抓屏那一小段把系统光标藏起来：懒创建一个 4×4 全透明的 helper 窗口 → `show()` + `focus()` 并轮询 `document.hasFocus()` → `requestPointerLock()`（`executeJavaScript(code, true)` 伪造用户手势；从后台/全局快捷键触发时先 `app.focus({ steal: true })`）→ 所有屏的**像素**（含各自的稳定校正）都到手后立刻 `exitPointerLock()` 并隐藏窗口，`toPng` 编码不等。拿锁本身约 100ms，整个链路通常几百毫秒。
+
+  两个必须知道的约束：① pointer lock 会随窗口失焦被 Chromium 立刻放掉（规范要求），所以冻结画面改用 `showInactive()`、不抢焦点，并且每拍抓屏前都会问一次 `document.pointerLockElement`，丢了只记一条 `藏光标已失效（…）`，不会静默地给你一张带指针的图；② 拿不到锁（没手势/文档没聚焦/渲染端卡死）同样只记 `藏光标失败`、照常抓屏，最坏结果是这一张图带指针（与修复前一致），不会卡住截图。helper 窗口整场只建一次、随 `before-quit` 销毁（它常驻会让宿主的 `window-all-closed` 不再触发）。不接受这几百毫秒的副作用（可能抢一次前台焦点、指针位置被冻结、点击落在 helper 上）就传 `hideCursor: false`。Windows 的 GDI `BitBlt` 与 Linux X11 本来就不含指针，`desktopCapturer` 兜底路径也不含，所以这条只在 macOS 生效。
+
 - **防截屏模式下的"虚影/残影"**（`mainWindow.hide()` 之后立刻起截图）：抓屏拿到的是**调用那一刻屏幕上的合成结果**，而 `hide()` 要等 WindowServer 处理完才真的从画面上消失，中间只有几个微任务 —— 于是宿主的窗口原封不动地进了底图。实测（按窗口区域像素统计）：`hide()` 后 `+0ms` 抓，窗口像素占 26.0%（和可见时的 26.2% 一样）；`+16ms` 剩 0.3%（只剩边缘）；`+50ms` 才 0.00%。
 
-  所以 `capture()` 在本轮**第一次**抓屏前会先等 `captureSettleMs`（默认 50ms），这段等待和 `createWindow`（`reset` 要等渲染端回执）并行，实际几乎不增加"从点击到画面锁住"的耗时（实测 `startCapture` 总耗时里 `capture + createWindow` 仍是取两者较大者）。宿主如果自己做过渡动画、或者 hide 之后还有别的异步动作，把 `captureSettleMs` 调大即可；`0` 关闭。
+  所以 `capture()` 在本轮**第一次**抓屏前会先等 `captureSettleMs`（默认 50ms），这段等待和 `createWindow`（`reset` 要等渲染端回执）并行，实际几乎不增加"从点击到画面锁住"的耗时（实测 `startCapture` 总耗时里 `capture + createWindow` 仍是取两者较大者）。宿主如果自己做过渡动画、或者 hide 之后还有别的异步动作，把 `captureSettleMs` 调大即可；`0` 只关掉这段合成等待 —— macOS 上第一次抓屏仍会等光标锁（见下一条，通常几十到一两百毫秒）。
 
   要复测这条时序，跑 `npx electron scripts/ghost-check.cjs`（先 `npm run build`）：它拿一块纯品红无边框窗口当探针，统计 `hide()` 后 0/16/33/50ms 抓屏时矩形内的品红残留比例，同时打印 `node-screenshots` 的加载结果和兜底路径 `desktopCapturer` 第一帧的对照值。基线（窗口可见时）拿不到品红就说明没有屏幕录制权限，脚本会直接中止而不是给出误导性的"没有残影"。注意抓屏本身要几十上百毫秒，所以 +0ms 那一档的实际采样点已经晚于请求，低于这个量级的差异测不出来。
 
@@ -292,8 +296,13 @@ export interface ScreenshotsOpts {
   // 抓屏前等多久（毫秒），默认 50：给宿主「隐藏自己窗口」留出合成器时间，
   // 否则 hide() 之后立刻抓屏会抓到 hide 生效前那一帧 —— 底图上留下宿主的残影。
   // 只在本轮第一次抓屏前等一次，且与建窗口并行，基本不增加"从点击到画面锁住"的耗时。
-  // 传 0 关闭（宿主自己保证抓屏时窗口已不在画面上）
+  // 传 0 只关掉这段合成等待；macOS 上第一次抓屏仍会等光标锁（见 hideCursor）
   captureSettleMs?: number;
+  // macOS 抓屏时是否临时把系统光标藏起来，默认 true（pointer lock 方案）。
+  // 代价：可能抢一次前台焦点、这几百毫秒内指针被冻结且点击落在 helper 窗口上，
+  // 并常驻一个隐藏窗口；传 false 后底图会像修复前一样带指针。
+  // Windows / Linux 本来就不含指针，这个选项在那边是空操作。
+  hideCursor?: boolean;
   // 抓屏后端：auto（默认）/ native / electron。auto 在 Linux Wayland 会话下禁用
   // node-screenshots 原生后端，改走 Electron desktopCapturer（避免 libwayshot panic/abort）。
   // 确认原生可用的 wlroots 合成器可显式传 native，或用环境变量
